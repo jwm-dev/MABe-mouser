@@ -488,17 +488,33 @@ class PoseViewerUIMixin:
         shortcut_space.activated.connect(self._toggle_play)
         self._shortcuts.append(shortcut_space)
 
+        shortcut_k = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_K), self.root)
+        shortcut_k.activated.connect(self._toggle_play)
+        self._shortcuts.append(shortcut_k)
+
         shortcut_left = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Left), self.root)
         shortcut_left.activated.connect(self._step_backward)
         self._shortcuts.append(shortcut_left)
+
+        shortcut_j = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_J), self.root)
+        shortcut_j.activated.connect(self._step_backward)
+        self._shortcuts.append(shortcut_j)
 
         shortcut_right = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Right), self.root)
         shortcut_right.activated.connect(self._step_forward)
         self._shortcuts.append(shortcut_right)
 
+        shortcut_l = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_L), self.root)
+        shortcut_l.activated.connect(self._step_forward)
+        self._shortcuts.append(shortcut_l)
+
         shortcut_reset = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_R), self.root)
         shortcut_reset.activated.connect(self._handle_reset_view_shortcut)
         self._shortcuts.append(shortcut_reset)
+
+        shortcut_labels = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Q), self.root)
+        shortcut_labels.activated.connect(self._toggle_labels)
+        self._shortcuts.append(shortcut_labels)
 
         self.root.register_close_callback(self._on_close)
 
@@ -633,8 +649,11 @@ class PoseViewerUIMixin:
     @staticmethod
     def _format_timestamp(seconds: float) -> str:
         total_seconds = max(0, int(round(seconds)))
-        minutes, remainder = divmod(total_seconds, 60)
-        return f"{minutes:02d}:{remainder:02d}"
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours > 0:
+            return f"{hours:d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
 
     def _connect_scene_hover(self, callback: Callable[[Optional[dict]], None]) -> None:
         self.scene.on_hover(callback)
@@ -701,9 +720,6 @@ class PoseViewerUIMixin:
 
     def _scene_add_edges(self, segments: Any, *, color: tuple[float, float, float]) -> None:
         self.scene.add_body_edges(segments, color=color, width=2.0)
-
-    def _scene_add_trail(self, segments: Any, *, color: tuple[float, float, float]) -> None:
-        self.scene.add_trail_segments(segments, color=color, width=2.2)
 
     def _scene_add_tail_polyline(
         self,

@@ -13,6 +13,7 @@ class HoverDataset:
     positions: np.ndarray
     labels: Sequence[str]
     mouse_id: str
+    color: Tuple[float, float, float] = (1.0, 1.0, 1.0)
     screen_positions: Optional[np.ndarray] = None
 
 

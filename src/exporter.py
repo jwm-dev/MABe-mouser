@@ -108,9 +108,6 @@ class PoseViewerExportMixin:
         original_progress_value = self.progress_var.get()
         was_playing = self.playing
 
-        trail_cache_backup = self.trail_cache
-        tail_histories_backup = self.tail_histories
-
         self._force_pause_playback()
         if hasattr(self, "export_action"):
             self.export_action.setEnabled(False)
@@ -119,9 +116,6 @@ class PoseViewerExportMixin:
         self.progressbar.setRange(0, 100)
         self.progress_var.set(0.0)
         self._set_status(f"Exporting {destination.name}…")
-        self.trail_cache = {}
-        self.tail_histories = {}
-
         try:
             with writer:
                 total = len(payloads)
@@ -137,9 +131,6 @@ class PoseViewerExportMixin:
                     self._set_status(f"Exporting {destination.name} ({frame_idx + 1}/{total})…")
                     QtWidgets.QApplication.processEvents()
         finally:
-            self.trail_cache = trail_cache_backup
-            self.tail_histories = tail_histories_backup
-
             self.slider_active = True
             self.frame_slider.setValue(original_index)
             self.slider_active = False

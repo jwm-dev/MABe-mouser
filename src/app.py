@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import sys
-from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -38,7 +37,6 @@ class PoseViewerApp(
         self,
         root: Any,
         parquet_files: Sequence[Path],
-        trail_length: int = 14,
         use_gpu: bool = False,
     ) -> None:
         if not parquet_files:
@@ -50,12 +48,10 @@ class PoseViewerApp(
         self.parquet_files: List[Path] = list(parquet_files)
         self.current_file_index: int = 0
         self.current_data: Optional[Dict[str, object]] = None
-        self.trail_length = max(3, trail_length)
-        self.trail_visual_length = max(5, min(10, self.trail_length))
-        self.trail_cache: Dict[str, List[np.ndarray]] = {}
         self.mouse_colors: Dict[str, Tuple[float, float, float]] = {}
         self.use_gpu = bool(use_gpu and cudf is not None)
-        self.tail_histories: Dict[str, deque[np.ndarray]] = {}
+
+        self._set_initial_active_directory()
 
         self.playing: bool = False
         self.playback_speed_multiplier: float = 1.0
@@ -96,6 +92,26 @@ class PoseViewerApp(
         self._register_bindings()
         self._connect_scene_hover(self._handle_hover_payload)
         self._load_current_file()
+
+    def _set_initial_active_directory(self) -> None:
+        if not self.parquet_files:
+            return
+        parents = {path.parent for path in self.parquet_files}
+        if len(parents) <= 1:
+            return
+        initial_index = min(max(self.current_file_index, 0), len(self.parquet_files) - 1)
+        initial_path = self.parquet_files[initial_index]
+        folder = initial_path.parent
+        if not folder.exists():
+            return
+        files = sorted(p for p in folder.glob("*.parquet") if p.is_file())
+        if not files:
+            return
+        self.parquet_files = files
+        try:
+            self.current_file_index = files.index(initial_path)
+        except ValueError:
+            self.current_file_index = 0
 
     def _resolve_cache_directory(self) -> Path:
         env_override = os.environ.get("MABE_POSE_CACHE_DIR")

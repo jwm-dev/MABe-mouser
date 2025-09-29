@@ -60,9 +60,7 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
         self.progressbar.setRange(0, 100)
         self.progress_var.set(0.0)
         self._queue_progress_update(0.0, f"Loading {path.name}…")
-        self.trail_cache.clear()
         self.mouse_colors.clear()
-        self.tail_histories.clear()
         self.current_data = None
         self._clear_preserved_camera()
         self._scene_begin_frame(xlim=(0.0, 1.0), ylim=(0.0, 1.0), aspect=1.0)

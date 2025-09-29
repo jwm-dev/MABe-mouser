@@ -15,8 +15,17 @@ class PoseViewerHoverMixin:
                     self._hover_prev_status = str(self.status_var.get())
                 except Exception:
                     self._hover_prev_status = None
-                display = f"{payload['text']} ({payload['x']:.1f}, {payload['y']:.1f})"
-                self._set_status(display)
+            display = payload.get("status")
+            if display is None:
+                x_val = float(payload.get("x", 0.0))
+                y_val = float(payload.get("y", 0.0))
+                coords = f"x: {x_val:.2f}, y: {y_val:.2f}"
+                label = payload.get("text")
+                if label:
+                    display = f"{label} — {coords}"
+                else:
+                    display = coords
+            self._set_status(display)
         else:
             if self._hover_prev_status is not None:
                 self._set_status(self._hover_prev_status)

@@ -48,12 +48,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Limit the number of parquet files loaded into the carousel",
     )
     parser.add_argument(
-        "--trail-length",
-        type=int,
-        default=25,
-        help="How many past frames to show when rendering motion trails",
-    )
-    parser.add_argument(
         "--gpu",
         action="store_true",
         help="Attempt GPU-accelerated preprocessing with cuDF when available",
@@ -78,7 +72,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     use_gpu = bool(args.gpu and cudf is not None)
     if args.gpu and not use_gpu:
         print("[pose_viewer_gui] cuDF not available; continuing on CPU", file=sys.stderr)
-    app = PoseViewerApp(root, files, trail_length=args.trail_length, use_gpu=use_gpu)
+    app = PoseViewerApp(root, files, use_gpu=use_gpu)
     try:
         run_mainloop(root)
     finally:

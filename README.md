@@ -93,7 +93,8 @@ Ensure the extracted `train.csv`, `test.csv`, and parquet folders remain in `MAB
 
 3. Within the UI:
 	- Use the dataset dropdown to switch between sessions.
-	- Scrub timelines with the playback controls or the keyboard (←/→ for frame step, space for play/pause).
+	- Scrub timelines with the playback controls or the keyboard (←/→ or J/L to step frames, space or K to play/pause).
+	- Press Q to toggle label overlays without using the mouse.
 	- Hover markers to inspect per-mouse metadata.
 	- Toggle overlays and rendering options through the sidebar.
 

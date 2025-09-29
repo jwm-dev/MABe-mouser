@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -14,7 +13,7 @@ import numpy as np
 from .geometry import PoseViewerGeometryMixin
 from .models import FramePayload, MouseGroup
 from .plotting import SceneRect, get_palette_color
-from .render import draw_mouse_group, draw_trail, split_tail_points
+from .render import draw_mouse_group
 
 
 class PoseViewerPlaybackMixin(PoseViewerGeometryMixin):
@@ -119,6 +118,17 @@ class PoseViewerPlaybackMixin(PoseViewerGeometryMixin):
         print("[Playback] reset_view shortcut clearing override and resetting scene")
         self._camera_override_rect = None
         scene.reset_camera_view()
+
+    def _toggle_labels(self) -> None:
+        scene = getattr(self, "scene", None)
+        if scene is None:
+            print("[Playback] toggle_labels shortcut ignored (no scene)")
+            return
+        toggle = getattr(scene, "toggle_labels_visible", None)
+        if not callable(toggle):
+            print("[Playback] toggle_labels shortcut ignored (no toggle method)")
+            return
+        toggle()
 
     def _resolve_cm_per_pixel(
         self,
@@ -440,7 +450,6 @@ class PoseViewerPlaybackMixin(PoseViewerGeometryMixin):
 
         self._render_pose_state(
             frame_payload.mouse_groups,
-            frame_index_for_trails=frame_index,
             frame_label_value=frame_payload.frame_number,
             frame_title=f"Frame {frame_payload.frame_number}",
             behaviors=frame_payload.behaviors,
@@ -450,7 +459,6 @@ class PoseViewerPlaybackMixin(PoseViewerGeometryMixin):
         self,
         mouse_groups: Dict[str, MouseGroup],
         *,
-        frame_index_for_trails: int,
         frame_label_value: int,
         frame_title: str,
         behaviors: Mapping[str, str],
@@ -546,12 +554,10 @@ class PoseViewerPlaybackMixin(PoseViewerGeometryMixin):
         self._update_canvas_labels(xlabel=f"X ({label_suffix})", ylabel=f"Y ({label_suffix})", title=frame_title)
 
         self._ensure_mouse_colors(mouse_groups.keys())
-        self._update_trails(frame_index_for_trails)
 
         for mouse_id, group in mouse_groups.items():
             color = self.mouse_colors[mouse_id]
             draw_mouse_group(self, mouse_id, group, color)
-            draw_trail(self, mouse_id, color)
 
         self._scene_finalize_frame()
         self._set_frame_value(int(frame_label_value))
@@ -598,7 +604,6 @@ class PoseViewerPlaybackMixin(PoseViewerGeometryMixin):
             self._playback_frame_position = position
             self._render_pose_state(
                 base_payload.mouse_groups,
-                frame_index_for_trails=base_index,
                 frame_label_value=base_payload.frame_number,
                 frame_title=f"Frame {base_payload.frame_number}",
                 behaviors=base_payload.behaviors,
@@ -611,7 +616,6 @@ class PoseViewerPlaybackMixin(PoseViewerGeometryMixin):
         self._playback_frame_position = position
         self._render_pose_state(
             interpolated_groups,
-            frame_index_for_trails=base_index,
             frame_label_value=base_payload.frame_number,
             frame_title=frame_title,
             behaviors=base_payload.behaviors,
@@ -681,32 +685,6 @@ class PoseViewerPlaybackMixin(PoseViewerGeometryMixin):
             if mouse_id in self.mouse_colors:
                 continue
             self.mouse_colors[mouse_id] = get_palette_color(idx, palette="tab20")
-
-    def _update_trails(self, frame_index: int) -> None:
-        if not self.current_data:
-            return
-        payloads: List[FramePayload] = self.current_data["payloads"]  # type: ignore[assignment]
-        start_index = max(0, frame_index - self.trail_length)
-        history: Dict[str, List[np.ndarray]] = defaultdict(list)
-        for idx in range(start_index, frame_index + 1):
-            frame_payload = payloads[idx]
-            for mouse_id, group in frame_payload.mouse_groups.items():
-                core_points, _, tail_points, _ = split_tail_points(self, group)
-                points_for_centroid = core_points if len(core_points) > 0 else group.points
-                if points_for_centroid.size == 0:
-                    continue
-                centroid = points_for_centroid.mean(axis=0)
-                history[mouse_id].append(centroid)
-
-                tail_history = self.tail_histories.setdefault(mouse_id, deque(maxlen=20))
-                if len(tail_points) > 0:
-                    distances = np.linalg.norm(tail_points - centroid, axis=1)
-                    tip_idx = int(np.argmax(distances))
-                    tail_history.append(np.asarray(tail_points[tip_idx], dtype=np.float32))
-                elif tail_history:
-                    relaxed = (0.75 * tail_history[-1]) + (0.25 * centroid)
-                    tail_history.append(relaxed.astype(np.float32))
-        self.trail_cache = history
 
 
 __all__ = ["PoseViewerPlaybackMixin"]

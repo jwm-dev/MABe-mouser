@@ -40,11 +40,18 @@ def add_body_markers(
     label_tuple = tuple(labels)
     if len(label_tuple) < count:
         label_tuple = label_tuple + tuple(f"node-{idx}" for idx in range(len(label_tuple), count))
+    base_rgb = _rgba(base_color, 1.0)[:3]
+    hover_color = (
+        float(base_rgb[0]),
+        float(base_rgb[1]),
+        float(base_rgb[2]),
+    )
     self._hover_datasets.append(
         HoverDataset(
             positions=positions_scene[:, :2].astype(np.float32, copy=False),
             labels=label_tuple,
             mouse_id=mouse_id,
+            color=hover_color,
         )
     )
 
@@ -78,44 +85,20 @@ def add_tail_markers(
     label_tuple = tuple(labels)
     if len(label_tuple) < count:
         label_tuple = label_tuple + tuple(f"tail-{idx}" for idx in range(len(label_tuple), count))
+    base_rgb = _rgba(base_color, 1.0)[:3]
+    hover_color = (
+        float(base_rgb[0]),
+        float(base_rgb[1]),
+        float(base_rgb[2]),
+    )
     self._hover_datasets.append(
         HoverDataset(
             positions=positions_scene[:, :2].astype(np.float32, copy=False),
             labels=label_tuple,
             mouse_id=mouse_id,
+            color=hover_color,
         )
     )
-
-
-def add_trail_segments(
-    self,
-    segments: Iterable[Tuple[np.ndarray, np.ndarray, float]],
-    *,
-    color: Sequence[float],
-    width: float,
-) -> None:
-    if not segments:
-        return
-    segment_positions: List[np.ndarray] = []
-    segment_colors: List[np.ndarray] = []
-    for entry in segments:
-        if len(entry) == 3:
-            start, end, alpha = entry
-        elif len(entry) == 2:
-            start, end = entry  # type: ignore[misc]
-            alpha = 1.0
-        else:
-            continue
-        stack = np.vstack((np.asarray(start, dtype=np.float32), np.asarray(end, dtype=np.float32)))
-        stack_scene = self._to_scene_units_array(stack).astype(np.float32, copy=False)
-        segment_positions.append(stack_scene)
-        segment_color = np.tile(_rgba(color, float(alpha)), (stack_scene.shape[0], 1))
-        segment_colors.append(segment_color)
-    if not segment_positions:
-        return
-    self._trail_segments.extend(segment_positions)
-    self._trail_colors.extend(segment_colors)
-    self._trail_widths.append(float(width))
 
 
 def add_body_edges(
@@ -298,13 +281,19 @@ def draw_whiskers(
         direction_unit = direction / norm
 
     whisker_length = min(max(norm * 0.85, 18.0), 48.0)
-    whisker_angles = (-0.55, -0.3, 0.3, 0.55)
+    whiskers_per_side = 3
+    side_angles = np.linspace(0.25, 0.68, whiskers_per_side, dtype=np.float32)
+    length_factors = np.linspace(0.92, 1.08, whiskers_per_side, dtype=np.float32)
     accent_color = self._lighten_color(base_color, 0.55)
     underline_color = self._lighten_color(base_color, 0.2)
     segments: List[Tuple[np.ndarray, np.ndarray]] = []
-    for angle in whisker_angles:
-        oriented = self._rotate_vector(direction_unit, angle)
-        tip = nose_point + oriented * whisker_length
+    for angle, factor in zip(side_angles[::-1], length_factors[::-1]):
+        oriented = self._rotate_vector(direction_unit, -float(angle))
+        tip = nose_point + oriented * (whisker_length * float(factor))
+        segments.append((nose_point.astype(np.float32), tip.astype(np.float32)))
+    for angle, factor in zip(side_angles, length_factors):
+        oriented = self._rotate_vector(direction_unit, float(angle))
+        tip = nose_point + oriented * (whisker_length * float(factor))
         segments.append((nose_point.astype(np.float32), tip.astype(np.float32)))
 
     if segments:
@@ -431,32 +420,9 @@ def draw_mouse_group(
         self._scene_add_hull(hull.astype(np.float32), color=fill_color)
 
 
-def draw_trail(self, mouse_id: str, base_color: Tuple[float, float, float]) -> None:
-    trail_points = self.trail_cache.get(mouse_id)
-    if not trail_points or len(trail_points) < 2:
-        return
-
-    segment_count = min(len(trail_points), self.trail_visual_length)
-    recent_points = trail_points[-segment_count:]
-    if len(recent_points) < 2:
-        return
-
-    alphas = np.linspace(0.12, 0.48, len(recent_points))
-    lightened = self._lighten_color(base_color, 0.12)
-    segments = []
-    for (x1, y1), (x2, y2), alpha in zip(recent_points[:-1], recent_points[1:], alphas[1:]):
-        start = np.asarray([x1, y1], dtype=np.float32)
-        end = np.asarray([x2, y2], dtype=np.float32)
-        segments.append((start, end, float(alpha * 0.7)))
-
-    if segments:
-        self._scene_add_trail(segments, color=lightened)
-
-
 __all__ = [
     "add_body_markers",
     "add_tail_markers",
-    "add_trail_segments",
     "add_body_edges",
     "add_tail_polyline",
     "add_whisker_segments",
@@ -465,5 +431,4 @@ __all__ = [
     "order_tail_sequence",
     "build_tail_polyline",
     "draw_mouse_group",
-    "draw_trail",
 ]

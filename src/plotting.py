@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 from vispy import app, scene
@@ -15,9 +15,10 @@ from vispy.visuals.axis import MaxNLocator
 from vispy.visuals.transforms import STTransform
 
 try:  # pragma: no cover - GUI unavailable
-	from PyQt6 import QtCore, QtWidgets  # type: ignore[attr-defined]
+	from PyQt6 import QtCore, QtGui, QtWidgets  # type: ignore[attr-defined]
 except Exception:  # pragma: no cover - PyQt not installed
 	QtCore = None
+	QtGui = None
 	QtWidgets = None
 
 from .camera import PoseSceneCameraMixin
@@ -60,6 +61,7 @@ LABEL_OVERLAP_PADDING = 6.0
 LABEL_TEXT_LINE_HEIGHT = 1.32
 LABEL_TEXT_WIDTH_FACTOR = 0.62
 LABEL_TEXT_EXTRA_CHARS = 1.4
+LABEL_MOUSE_PADDING = 18.0
 class PoseScene(PoseSceneCameraMixin):
 	def __init__(
 		self,
@@ -168,9 +170,6 @@ class PoseScene(PoseSceneCameraMixin):
 		self._tail_markers = visuals.Markers(parent=self.view.scene)
 		self._tail_markers.set_gl_state("translucent", depth_test=False)
 
-		self._trail_lines = visuals.Line(parent=self.view.scene, connect="segments")
-		self._trail_lines.set_gl_state("translucent", depth_test=False)
-
 		self._edge_lines = visuals.Line(parent=self.view.scene, connect="segments")
 		self._edge_lines.set_gl_state("translucent", depth_test=False)
 
@@ -234,12 +233,19 @@ class PoseScene(PoseSceneCameraMixin):
 		self._scale_bar_mode = "auto"
 		self._scale_bar_hit_rect: Optional[Tuple[float, float, float, float]] = None
 		self._scale_bar_click_armed = False
+		self._overlay_hover_sources: Set[str] = set()
+		self._overlay_hover_filters: List[Any] = []
 
 		self._reset_button: Optional[Any] = None
 		self._reset_button_effect: Optional[Any] = None
 		self._reset_button_callback: Optional[Callable[[], None]] = None
 		self._reset_button_margin = 14.0
+		self._labels_button: Optional[Any] = None
+		self._labels_button_effect: Optional[Any] = None
+		self._labels_enabled = True
+		self._labels_button_spacing = 8.0
 		self._initialise_reset_button()
+		self._initialise_labels_button()
 
 		self._hull_polygons: List[visuals.Polygon] = []
 		self._label_texts: List[visuals.Text] = []
@@ -273,10 +279,6 @@ class PoseScene(PoseSceneCameraMixin):
 		self._tail_face_colors: List[np.ndarray] = []
 		self._tail_edge_colors: List[np.ndarray] = []
 		self._tail_edge_widths: List[np.ndarray] = []
-
-		self._trail_segments: List[np.ndarray] = []
-		self._trail_colors: List[np.ndarray] = []
-		self._trail_widths: List[float] = []
 
 		self._edge_segments: List[np.ndarray] = []
 		self._edge_colors: List[np.ndarray] = []
@@ -912,6 +914,29 @@ class PoseScene(PoseSceneCameraMixin):
 				coords = coords / dpr
 		return coords
 
+	def _canvas_point_to_scene(
+		self,
+		point: Sequence[float],
+		*,
+		transform: Optional[Any] = None,
+	) -> Optional[Tuple[float, float]]:
+		if transform is None:
+			transform = self._scene_to_canvas_transform()
+		if transform is None:
+			return None
+		try:
+			mapped = transform.imap([float(point[0]), float(point[1]), 0.0])
+		except Exception:
+			return None
+		result = np.asarray(mapped[:2], dtype=np.float64)
+		if result.size < 2 or not np.all(np.isfinite(result[:2])):
+			return None
+		return (float(result[0]), float(result[1]))
+
+	def _format_coordinate_text(self, x: float, y: float) -> str:
+		unit = self._unit_label or "units"
+		return f"x: {x:.2f} {unit}, y: {y:.2f} {unit}"
+
 	def _compute_tick_positions(
 		self,
 		start: float,
@@ -1209,6 +1234,7 @@ class PoseScene(PoseSceneCameraMixin):
 			self._scale_bar_line.visible = False
 			self._scale_bar_text.visible = False
 			self._apply_reset_button_alpha(0.0)
+			self._apply_labels_button_alpha(0.0)
 			return
 		mode = getattr(self, "_scale_bar_mode", "auto")
 		alpha = float(max(0.0, min(1.0, self._scale_bar_alpha)))
@@ -1228,6 +1254,7 @@ class PoseScene(PoseSceneCameraMixin):
 		self._scale_bar_text.color = _rgba(UI_TEXT_PRIMARY, 0.92 * alpha)
 		self._scale_bar_text.visible = alpha > 0.0
 		self._apply_reset_button_alpha(alpha)
+		self._apply_labels_button_alpha(alpha)
 		self.request_draw()
 
 	def on_reset_request(self, callback: Optional[Callable[[], None]]) -> None:
@@ -1284,21 +1311,120 @@ class PoseScene(PoseSceneCameraMixin):
 		button.raise_()
 		self._reset_button = button
 		self._reset_button_effect = effect
+		self._attach_overlay_hover_filter(button, "reset_button")
 		self._update_reset_button_geometry(*self._viewport_size)
+
+		if self._labels_button is not None:
+			self._update_labels_button_icon()
+			self._apply_labels_button_alpha(self._scale_bar_alpha)
+
+	def _initialise_labels_button(self) -> None:
+		if self._labels_button is not None:
+			return
+		if QtWidgets is None:
+			return
+		native = getattr(self.canvas, "native", None)
+		if not isinstance(native, QtWidgets.QWidget):
+			return
+		button = QtWidgets.QToolButton(native)
+		button.setObjectName("PoseSceneLabelsButton")
+		button.setAutoRaise(True)
+		if QtCore is not None:
+			button.setIconSize(QtCore.QSize(22, 22))
+			button.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+			button.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+		button.setCheckable(True)
+		button.setChecked(self._labels_enabled)
+		button.setToolTip("Toggle labels (Q)")
+		button.setStyleSheet(
+			"QToolButton#PoseSceneLabelsButton {"
+			" background-color: rgba(17, 26, 48, 170);"
+			" border: 1px solid rgba(90, 114, 168, 160);"
+			" border-radius: 16px;"
+			" padding: 6px;"
+			" }"
+			" QToolButton#PoseSceneLabelsButton:hover {"
+			" background-color: rgba(28, 40, 68, 210);"
+			" }"
+			" QToolButton#PoseSceneLabelsButton:pressed {"
+			" background-color: rgba(12, 20, 38, 230);"
+			" }"
+		)
+		button.setFixedSize(34, 34)
+		self._labels_button = button
+		self._update_labels_button_icon()
+		effect = QtWidgets.QGraphicsOpacityEffect(button)
+		effect.setOpacity(0.0)
+		button.setGraphicsEffect(effect)
+		button.hide()
+		button.clicked.connect(self._on_labels_button_clicked)
+		button.raise_()
+		self._labels_button_effect = effect
+		self._attach_overlay_hover_filter(button, "labels_button")
+		self._update_reset_button_geometry(*self._viewport_size)
+		self._apply_labels_button_alpha(self._scale_bar_alpha)
+
+	def _update_labels_button_icon(self) -> None:
+		button = self._labels_button
+		if button is None:
+			return
+		keys_on = ("fa5s.tags", "fa.tags", "mdi.tag-multiple")
+		keys_off = ("fa5s.tag", "fa.tag", "mdi.tag")
+		icon: Optional[Any] = None
+		if qtawesome is not None:
+			candidates = keys_on if self._labels_enabled else keys_off
+			for key in candidates:
+				try:
+					icon = qtawesome.icon(key, color="#f4f7ff")
+					break
+				except Exception:
+					continue
+		if icon is not None:
+			button.setIcon(icon)
+			button.setText("")
+		else:
+			if QtGui is not None:
+				button.setIcon(QtGui.QIcon())
+			button.setText("LBL" if self._labels_enabled else "OFF")
+		if QtCore is not None:
+			button.setChecked(self._labels_enabled)
 
 	def _update_reset_button_geometry(self, canvas_w: float, canvas_h: float) -> None:
 		button = self._reset_button
-		if button is None:
+		label_button = self._labels_button
+		if button is None and label_button is None:
 			return
 		if canvas_w <= 0.0 or canvas_h <= 0.0:
 			return
-		width = button.width() or button.sizeHint().width()
-		height = button.height() or button.sizeHint().height()
 		margin = float(self._reset_button_margin)
-		x = int(max(margin, canvas_w - margin - width))
-		y = int(max(margin, margin))
-		button.move(x, y)
-		button.raise_()
+		spacing = float(self._labels_button_spacing)
+		base_y = int(max(margin, margin))
+		reset_width = button.width() if button is not None else 0
+		reset_height = button.height() if button is not None else 0
+		if button is not None:
+			if reset_width <= 0:
+				reset_width = button.sizeHint().width()
+			if reset_height <= 0:
+				reset_height = button.sizeHint().height()
+		reset_x = int(max(margin, canvas_w - margin - reset_width)) if button is not None else 0
+		if button is not None:
+			button.move(reset_x, base_y)
+		label_width = 0
+		label_height = 0
+		if label_button is not None:
+			label_width = label_button.width()
+			label_height = label_button.height()
+			if label_width <= 0:
+				label_width = label_button.sizeHint().width()
+			if label_height <= 0:
+				label_height = label_button.sizeHint().height()
+			label_x = canvas_w - margin - label_width if button is None else reset_x - spacing - label_width
+			label_x = int(max(margin, label_x))
+			label_y = base_y if button is None else base_y + max(0, (reset_height - label_height) // 2)
+			label_button.move(label_x, label_y)
+			label_button.raise_()
+		if button is not None:
+			button.raise_()
 
 	def _apply_reset_button_alpha(self, alpha: float) -> None:
 		button = self._reset_button
@@ -1313,6 +1439,20 @@ class PoseScene(PoseSceneCameraMixin):
 		if QtCore is not None:
 			button.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, clamped <= 0.02)
 
+	def _apply_labels_button_alpha(self, alpha: float) -> None:
+		button = self._labels_button
+		effect = self._labels_button_effect
+		if button is None or effect is None:
+			return
+		clamped = float(max(0.0, min(1.0, alpha)))
+		effect.setOpacity(clamped)
+		is_visible = clamped > 0.02
+		button.setVisible(is_visible)
+		button.setEnabled(clamped >= 0.35)
+		if QtCore is not None:
+			button.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, clamped <= 0.02)
+		button.setChecked(self._labels_enabled)
+
 	def _on_reset_button_clicked(self) -> None:
 		button = self._reset_button
 		effect = self._reset_button_effect
@@ -1322,12 +1462,44 @@ class PoseScene(PoseSceneCameraMixin):
 			return
 		self._invoke_reset_callback()
 
+	def _on_labels_button_clicked(self) -> None:
+		button = self._labels_button
+		effect = self._labels_button_effect
+		if button is None or effect is None:
+			return
+		if effect.opacity() <= 0.02 or not button.isVisible():
+			return
+		self._toggle_labels_enabled()
+
 	def _invoke_reset_callback(self) -> None:
 		callback = self._reset_button_callback
 		if callable(callback):
 			callback()
 		else:
 			self.reset_camera_view()
+
+	def _toggle_labels_enabled(self) -> None:
+		self._set_labels_enabled(not self._labels_enabled)
+
+	def _set_labels_enabled(self, enabled: bool) -> None:
+		enabled_flag = bool(enabled)
+		if self._labels_enabled == enabled_flag:
+			return
+		self._labels_enabled = enabled_flag
+		self._update_labels_button_icon()
+		if self._labels_button is not None:
+			self._labels_button.setChecked(enabled_flag)
+		self._request_label_layout(delay=0.0)
+		self.request_draw()
+
+	def set_labels_visible(self, enabled: bool) -> None:
+		self._set_labels_enabled(enabled)
+
+	def labels_visible(self) -> bool:
+		return self._labels_enabled
+
+	def toggle_labels_visible(self) -> None:
+		self._toggle_labels_enabled()
 
 	def _schedule_scale_bar_fade(self, delay: float) -> None:
 		self._cancel_scale_bar_fade()
@@ -1401,6 +1573,9 @@ class PoseScene(PoseSceneCameraMixin):
 			self._scale_bar_mode = "auto"
 			self._scale_bar_alpha = 1.0
 			self.show_scale_bar_hint(hold_delay=self._scale_bar_idle_delay)
+			if self._overlay_hover_sources:
+				self._cancel_scale_bar_fade()
+				self._set_scale_bar_alpha(1.0)
 		self._scale_bar_click_armed = False
 
 	def _scale_bar_contains_point(self, x: float, y: float) -> bool:
@@ -1409,6 +1584,76 @@ class PoseScene(PoseSceneCameraMixin):
 			return False
 		left, bottom, right, top = rect
 		return left <= x <= right and bottom <= y <= top
+
+	def _set_overlay_hover_state(self, source: str, active: bool) -> None:
+		source_key = str(source)
+		if active:
+			if source_key in self._overlay_hover_sources:
+				return
+			self._overlay_hover_sources.add(source_key)
+		else:
+			if source_key not in self._overlay_hover_sources:
+				return
+			self._overlay_hover_sources.remove(source_key)
+		mode = getattr(self, "_scale_bar_mode", "auto")
+		if mode != "auto":
+			return
+		if self._overlay_hover_sources:
+			if not self._scale_bar_geometry_ready:
+				self._update_scale_bar()
+			self._cancel_scale_bar_fade()
+			self._set_scale_bar_alpha(1.0)
+		else:
+			self._schedule_scale_bar_fade(self._scale_bar_idle_delay)
+
+	def _update_scale_bar_hover_from_pos(self, pos: Optional[Sequence[float]]) -> None:
+		if pos is None:
+			self._set_overlay_hover_state("scale_bar", False)
+			return
+		try:
+			x_val = float(pos[0])
+			y_val = float(pos[1])
+		except (TypeError, ValueError, IndexError):
+			self._set_overlay_hover_state("scale_bar", False)
+			return
+		inside = self._scale_bar_contains_point(x_val, y_val)
+		self._set_overlay_hover_state("scale_bar", inside)
+
+	def _attach_overlay_hover_filter(self, widget: Any, source: str) -> None:
+		if QtCore is None or widget is None:
+			return
+		try:
+			widget.setAttribute(QtCore.Qt.WidgetAttribute.WA_Hover, True)
+		except Exception:
+			pass
+		source_key = str(source)
+		owner = self
+
+		class _OverlayHoverFilter(QtCore.QObject):
+			def eventFilter(self, obj: Optional[QtCore.QObject], event: Optional[QtCore.QEvent]) -> bool:  # type: ignore[override]
+				if event is None:
+					return False
+				etype = event.type()
+				if etype in (
+					QtCore.QEvent.Type.Enter,
+					QtCore.QEvent.Type.HoverEnter,
+				):
+					owner._set_overlay_hover_state(source_key, True)
+				elif etype in (
+					QtCore.QEvent.Type.Leave,
+					QtCore.QEvent.Type.HoverLeave,
+				):
+					owner._set_overlay_hover_state(source_key, False)
+				elif etype in (
+					QtCore.QEvent.Type.Hide,
+					QtCore.QEvent.Type.Close,
+				):
+					owner._set_overlay_hover_state(source_key, False)
+				return False
+
+		filter_obj = _OverlayHoverFilter(widget)
+		widget.installEventFilter(filter_obj)
+		self._overlay_hover_filters.append(filter_obj)
 
 	@staticmethod
 	def _is_primary_mouse_button(event: Any) -> bool:
@@ -1435,6 +1680,8 @@ class PoseScene(PoseSceneCameraMixin):
 			x, y = float(pos[0]), float(pos[1])
 		except (TypeError, ValueError):
 			return False
+		if event_type in {"mouse_move", "mouse_press", "mouse_release"}:
+			self._update_scale_bar_hover_from_pos(pos)
 		if event_type == "mouse_press" and self._scale_bar_contains_point(x, y) and self._is_primary_mouse_button(event):
 			self._scale_bar_click_armed = True
 			if hasattr(event, "handled"):
@@ -1516,11 +1763,13 @@ class PoseScene(PoseSceneCameraMixin):
 		label_tuple = tuple(labels)
 		if len(label_tuple) < count:
 			label_tuple = label_tuple + tuple(f"node-{idx}" for idx in range(len(label_tuple), count))
+		base_rgba = _rgba(base_color, 1.0)
 		self._hover_datasets.append(
 			HoverDataset(
 				positions=positions_scene[:, :2].astype(np.float32, copy=False),
 				labels=label_tuple,
 				mouse_id=mouse_id,
+				color=(float(base_rgba[0]), float(base_rgba[1]), float(base_rgba[2])),
 			)
 		)
 
@@ -1553,43 +1802,15 @@ class PoseScene(PoseSceneCameraMixin):
 		label_tuple = tuple(labels)
 		if len(label_tuple) < count:
 			label_tuple = label_tuple + tuple(f"tail-{idx}" for idx in range(len(label_tuple), count))
+		base_rgba = _rgba(base_color, 1.0)
 		self._hover_datasets.append(
 			HoverDataset(
 				positions=positions_scene[:, :2].astype(np.float32, copy=False),
 				labels=label_tuple,
 				mouse_id=mouse_id,
+				color=(float(base_rgba[0]), float(base_rgba[1]), float(base_rgba[2])),
 			)
 		)
-
-	def add_trail_segments(
-		self,
-		segments: Iterable[Tuple[np.ndarray, np.ndarray, float]],
-		*,
-		color: Sequence[float],
-		width: float,
-	) -> None:
-		if not segments:
-			return
-		segment_positions: List[np.ndarray] = []
-		segment_colors: List[np.ndarray] = []
-		for entry in segments:
-			if len(entry) == 3:
-				start, end, alpha = entry
-			elif len(entry) == 2:
-				start, end = entry  # type: ignore[misc]
-				alpha = 1.0
-			else:
-				continue
-			stack = np.vstack((np.asarray(start, dtype=np.float32), np.asarray(end, dtype=np.float32)))
-			stack_scene = self._to_scene_units_array(stack).astype(np.float32, copy=False)
-			segment_positions.append(stack_scene)
-			segment_color = np.tile(_rgba(color, float(alpha)), (stack_scene.shape[0], 1))
-			segment_colors.append(segment_color)
-		if not segment_positions:
-			return
-		self._trail_segments.extend(segment_positions)
-		self._trail_colors.extend(segment_colors)
-		self._trail_widths.append(float(width))
 
 	def add_body_edges(
 		self,
@@ -1924,7 +2145,14 @@ class PoseScene(PoseSceneCameraMixin):
 			return False
 		return self._point_in_view(anchor)
 
-	def _layout_single_label(self, definition: LabelDefinition, *, transform: Optional[Any] = None) -> None:
+	def _layout_single_label(
+		self,
+		definition: LabelDefinition,
+		*,
+		transform: Optional[Any] = None,
+		protected_regions: Optional[List[Tuple[float, float, float, float]]] = None,
+		current_index: int = -1,
+	) -> None:
 		if not self._points_visible(definition.points, definition.anchor):
 			return
 		anchor_xy = definition.anchor.astype(np.float32, copy=False)
@@ -1964,6 +2192,16 @@ class PoseScene(PoseSceneCameraMixin):
 					continue
 				if any(self._bounds_overlap(bounds, existing) for existing in self._label_bounds):
 					continue
+				if protected_regions is not None and 0 <= current_index < len(protected_regions):
+					blocked = False
+					for region_index, region in enumerate(protected_regions):
+						if region_index == current_index:
+							continue
+						if self._bounds_overlap(bounds, region):
+							blocked = True
+							break
+					if blocked:
+						continue
 				best_bounds = bounds
 				best_position = (float(label_xy[0]), float(label_xy[1]), 0.0)
 				best_anchor = (anchor_x, anchor_y)
@@ -1974,12 +2212,26 @@ class PoseScene(PoseSceneCameraMixin):
 		if not candidate_found:
 			fallback_anchor = self._label_anchor_for_direction(base_direction)
 			label.anchors = fallback_anchor
-			label.pos = (float(anchor_xy[0]), float(anchor_xy[1]), 0.0)
+			fallback_pos = (float(anchor_xy[0]), float(anchor_xy[1]), 0.0)
+			label.pos = fallback_pos
 			scale_x, scale_y = self._scene_scale_at_point((float(anchor_xy[0]), float(anchor_xy[1])), transform=transform)
 			padding_scene = LABEL_OVERLAP_PADDING / max(min(scale_x, scale_y), 1e-6)
 			extent_scene = (extent_px[0] / scale_x, extent_px[1] / scale_y)
-			best_bounds = self._bounds_from_anchor((float(anchor_xy[0]), float(anchor_xy[1])), fallback_anchor, extent_scene, padding_scene)
-			best_position = tuple(label.pos)
+			best_bounds = self._bounds_from_anchor(fallback_pos[:2], fallback_anchor, extent_scene, padding_scene)
+			if protected_regions is not None and 0 <= current_index < len(protected_regions):
+				for region_index, region in enumerate(protected_regions):
+					if region_index == current_index:
+						continue
+					if self._bounds_overlap(best_bounds, region):
+						expand = LABEL_MOUSE_PADDING / max(min(scale_x, scale_y), 1e-6)
+						direction = (base_direction / max(float(np.linalg.norm(base_direction)), 1e-6)).astype(np.float32, copy=False)
+						label_offset = anchor_xy + direction * (offset + expand)
+						adjusted_pos = (float(label_offset[0]), float(label_offset[1]), 0.0)
+						label.pos = adjusted_pos
+						best_position = adjusted_pos
+						best_bounds = self._bounds_from_anchor(adjusted_pos[:2], fallback_anchor, extent_scene, padding_scene)
+						break
+			best_position = fallback_pos if best_position is None else best_position
 			best_anchor = fallback_anchor
 		if best_position is None:
 			best_position = (float(anchor_xy[0]), float(anchor_xy[1]), 0.0)
@@ -1997,7 +2249,7 @@ class PoseScene(PoseSceneCameraMixin):
 		if np.linalg.norm(line_start - line_end) <= 1e-4:
 			return
 		line_segment = np.vstack((line_start, line_end)).astype(np.float32, copy=False)
-		line_color = np.tile(_rgba(definition.color, 0.55), (2, 1)).astype(np.float32, copy=False)
+		line_color = np.tile(_rgba(definition.color, 0.32), (2, 1)).astype(np.float32, copy=False)
 		self._label_line_segments.append(line_segment)
 		self._label_line_colors.append(line_color)
 
@@ -2037,14 +2289,43 @@ class PoseScene(PoseSceneCameraMixin):
 		self._label_bounds.clear()
 		self._label_line_segments.clear()
 		self._label_line_colors.clear()
+		if not self._labels_enabled:
+			self._label_lines.visible = False
+			self._label_lines.set_data(
+				pos=np.zeros((0, 3), dtype=np.float32),
+				color=np.zeros((0, 4), dtype=np.float32),
+				width=0.0,
+			)
+			self._label_layout_dirty = False
+			return
 		if not self._label_definitions:
 			self._label_lines.visible = False
 			self._label_lines.set_data(pos=np.zeros((0, 3), dtype=np.float32), color=np.zeros((0, 4), dtype=np.float32), width=0.0)
 			self._label_layout_dirty = False
 			return
 		transform = self._scene_to_canvas_transform()
+		protected_regions: List[Tuple[float, float, float, float]] = []
 		for definition in self._label_definitions:
-			self._layout_single_label(definition, transform=transform)
+			points = definition.points
+			if points.size == 0:
+				points = definition.anchor.reshape(1, 2)
+			x_values = points[:, 0].astype(np.float64, copy=False)
+			y_values = points[:, 1].astype(np.float64, copy=False)
+			anchor_point = (float(definition.anchor[0]), float(definition.anchor[1]))
+			scale_x, scale_y = self._scene_scale_at_point(anchor_point, transform=transform)
+			padding_scene = LABEL_MOUSE_PADDING / max(min(scale_x, scale_y), 1e-6)
+			x_min = float(np.min(x_values)) - padding_scene
+			y_min = float(np.min(y_values)) - padding_scene
+			x_max = float(np.max(x_values)) + padding_scene
+			y_max = float(np.max(y_values)) + padding_scene
+			protected_regions.append((x_min, y_min, x_max, y_max))
+		for index, definition in enumerate(self._label_definitions):
+			self._layout_single_label(
+				definition,
+				transform=transform,
+				protected_regions=protected_regions,
+				current_index=index,
+			)
 		if self._label_line_segments:
 			segments = np.vstack(self._label_line_segments)
 			colors = np.vstack(self._label_line_colors)
@@ -2114,11 +2395,6 @@ class PoseScene(PoseSceneCameraMixin):
 			)
 		else:
 			self._tail_markers.set_data(pos=np.zeros((0, 3), dtype=np.float32))
-
-		trail_pos = _concat(self._trail_segments)
-		trail_colors = _concat(self._trail_colors)
-		trail_width = float(np.mean(self._trail_widths or [2.0]))
-		_update_line_visual(self._trail_lines, trail_pos, trail_colors, trail_width)
 
 		edge_pos = _concat(self._edge_segments)
 		edge_colors = _concat(self._edge_colors)
@@ -2193,16 +2469,18 @@ class PoseScene(PoseSceneCameraMixin):
 		self.request_draw()
 
 	def _on_mouse_move(self, event: Any) -> None:
+		pos_value = getattr(event, "pos", None)
+		self._update_scale_bar_hover_from_pos(pos_value)
 		if not self._hover_datasets:
 			return
-		if event.pos is None:
+		if pos_value is None:
 			self._set_hover(None)
 			return
 		transform = self._scene_to_canvas_transform()
 		if transform is None:
 			self._set_hover(None)
 			return
-		pos = np.array(event.pos[:2], dtype=np.float32)
+		pos = np.array(pos_value[:2], dtype=np.float32)
 		closest: Optional[Tuple[HoverDataset, int, float]] = None
 		for dataset in self._hover_datasets:
 			positions = dataset.positions
@@ -2219,30 +2497,70 @@ class PoseScene(PoseSceneCameraMixin):
 			if dist <= self._hover_threshold_px and (closest is None or dist < closest[2]):
 				closest = (dataset, idx, dist)
 		if closest is None:
-			self._set_hover(None)
+			scene_point = self._canvas_point_to_scene(pos, transform=transform)
+			if scene_point is None:
+				self._set_hover(None)
+				return
+			x_val, y_val = scene_point
+			arena = self._arena_rect
+			if arena is not None:
+				if not (
+					arena.x - 1e-6 <= x_val <= arena.x + arena.width + 1e-6
+					and arena.y - 1e-6 <= y_val <= arena.y + arena.height + 1e-6
+				):
+					self._set_hover(None)
+					return
+			elif not self._point_in_view((x_val, y_val)):
+				self._set_hover(None)
+				return
+			coords_text = self._format_coordinate_text(x_val, y_val)
+			self._set_hover(
+				{
+					"x": float(x_val),
+					"y": float(y_val),
+					"status": f"Cursor — {coords_text}",
+					"show_text": False,
+				}
+			)
 			return
 		dataset, idx, _ = closest
 		data_pos = dataset.positions[idx]
 		label = dataset.labels[idx] if idx < len(dataset.labels) else f"point {idx}"
+		coords_text = self._format_coordinate_text(float(data_pos[0]), float(data_pos[1]))
 		self._set_hover(
 			{
 				"x": float(data_pos[0]),
 				"y": float(data_pos[1]),
 				"text": f"{dataset.mouse_id} · {label}",
+				"color": getattr(dataset, "color", (1.0, 1.0, 1.0)),
+				"status": f"{dataset.mouse_id} · {label} — {coords_text}",
 			}
 		)
 
 	def _set_hover(self, payload: Optional[Dict[str, Any]]) -> None:
 		if payload is None:
 			self._hover_text.visible = False
+			self._hover_text.color = _rgba(UI_ACCENT, 0.94)
 			if self._hover_callback:
 				self._hover_callback(None)
 			self.request_draw()
 			return
 
-		self._hover_text.text = payload["text"]
-		self._hover_text.pos = (payload["x"], payload["y"], 0.0)
-		self._hover_text.visible = True
+		show_text = bool(payload.get("show_text", True))
+		if show_text:
+			color_value = payload.get("color")
+			if color_value is not None:
+				self._hover_text.color = _rgba(color_value, 0.94)
+			else:
+				self._hover_text.color = _rgba(UI_ACCENT, 0.94)
+			text_value = str(payload.get("text", ""))
+			self._hover_text.text = text_value
+			self._hover_text.pos = (payload["x"], payload["y"], 0.0)
+			self._hover_text.visible = bool(text_value)
+		else:
+			self._hover_text.visible = False
+			self._hover_text.text = ""
+			self._hover_text.color = _rgba(UI_ACCENT, 0.94)
 		if self._hover_callback:
 			self._hover_callback(payload)
 		self.request_draw()
