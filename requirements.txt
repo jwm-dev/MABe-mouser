@@ -1,0 +1,9 @@
+# Core dependencies for the pose viewer application
+numpy
+pandas
+PyQt6
+vispy
+imageio
+pyarrow
+qtawesome
+kaggle

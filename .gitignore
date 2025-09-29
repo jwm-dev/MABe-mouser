@@ -1,0 +1,5 @@
+# Project-specific ignores
+.idea/
+.venv/
+MABe-mouse-behavior-detection/
+src/__pycache__/
