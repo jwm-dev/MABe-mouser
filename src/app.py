@@ -19,7 +19,6 @@ from .file_loader import PoseViewerFileMixin
 from .hover import PoseViewerHoverMixin
 from .optional_dependencies import cudf, imageio, pq
 from .playback import PoseViewerPlaybackMixin
-from .plotting import initialise_viewer_theme
 from .status import PoseViewerStatusMixin
 from .ui import PoseViewerUIMixin
 
@@ -91,8 +90,6 @@ class PoseViewerApp(
         else:
             self.cache_enabled = False
             self.cache_dir = package_dir
-
-        initialise_viewer_theme()
 
         self._build_ui()
         self._init_playback_state()

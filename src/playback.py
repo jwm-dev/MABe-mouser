@@ -14,6 +14,7 @@ import numpy as np
 from .geometry import PoseViewerGeometryMixin
 from .models import FramePayload, MouseGroup
 from .plotting import SceneRect, get_palette_color
+from .render import draw_mouse_group, draw_trail, split_tail_points
 
 
 class PoseViewerPlaybackMixin(PoseViewerGeometryMixin):
@@ -181,21 +182,6 @@ class PoseViewerPlaybackMixin(PoseViewerGeometryMixin):
             if px_height:
                 return arena_height_cm / px_height
         return None
-
-    def _points_to_scene_units(self, points: np.ndarray) -> np.ndarray:
-        scale = self._cm_per_pixel
-        array = points.astype(np.float32, copy=False)
-        if not scale or not math.isfinite(scale) or scale <= 0.0:
-            return array
-        if math.isclose(scale, 1.0, rel_tol=1e-9, abs_tol=1e-9):
-            return array
-        return (array.astype(np.float32, copy=True)) * float(scale)
-
-    def _scalar_to_scene_units(self, value: float) -> float:
-        scale = self._cm_per_pixel
-        if scale and math.isfinite(scale) and scale > 0.0:
-            return float(value) * float(scale)
-        return float(value)
 
     def _configure_playback_timeline(self, *, path: Path, data: Dict[str, object]) -> None:
         frames_array = np.asarray(data.get("frames", []), dtype=np.int64)
@@ -564,8 +550,8 @@ class PoseViewerPlaybackMixin(PoseViewerGeometryMixin):
 
         for mouse_id, group in mouse_groups.items():
             color = self.mouse_colors[mouse_id]
-            self._draw_mouse_group(mouse_id, group, color)
-            self._draw_trail(mouse_id, color)
+            draw_mouse_group(self, mouse_id, group, color)
+            draw_trail(self, mouse_id, color)
 
         self._scene_finalize_frame()
         self._set_frame_value(int(frame_label_value))
@@ -705,7 +691,7 @@ class PoseViewerPlaybackMixin(PoseViewerGeometryMixin):
         for idx in range(start_index, frame_index + 1):
             frame_payload = payloads[idx]
             for mouse_id, group in frame_payload.mouse_groups.items():
-                core_points, _, tail_points, _ = self._split_tail_points(group)
+                core_points, _, tail_points, _ = split_tail_points(self, group)
                 points_for_centroid = core_points if len(core_points) > 0 else group.points
                 if points_for_centroid.size == 0:
                     continue
@@ -721,266 +707,6 @@ class PoseViewerPlaybackMixin(PoseViewerGeometryMixin):
                     relaxed = (0.75 * tail_history[-1]) + (0.25 * centroid)
                     tail_history.append(relaxed.astype(np.float32))
         self.trail_cache = history
-
-    def _split_tail_points(
-        self,
-        group: MouseGroup,
-    ) -> Tuple[np.ndarray, Tuple[str, ...], np.ndarray, Tuple[str, ...]]:
-        points = group.points
-        if len(points) == 0:
-            empty = np.empty((0, 2), dtype=np.float32)
-            return empty, tuple(), empty, tuple()
-
-        labels_array = np.array(group.labels, dtype=object)
-        tail_mask = np.zeros(len(points), dtype=bool)
-
-        if labels_array.size:
-            tail_mask = np.array(["tail" in str(label).lower() for label in labels_array], dtype=bool)
-
-        if not tail_mask.any() and len(points) >= 4:
-            centroid = points.mean(axis=0)
-            distances = np.linalg.norm(points - centroid, axis=1)
-            median = float(np.median(distances))
-            mad = float(np.median(np.abs(distances - median)))
-            spread = mad if mad > 1e-6 else float(np.std(distances))
-            if spread > 1e-6:
-                threshold = median + 3.2 * spread
-                tail_mask = distances > threshold
-                if tail_mask.sum() > max(2, len(points) // 2):
-                    top_indices = np.argsort(distances)[-max(2, len(points) // 4):]
-                    mask = np.zeros_like(tail_mask)
-                    mask[top_indices] = True
-                    tail_mask = mask
-
-        core_indices = np.where(~tail_mask)[0]
-        tail_indices = np.where(tail_mask)[0]
-
-        core_points = points[core_indices]
-        core_labels = tuple(str(labels_array[i]) for i in core_indices) if labels_array.size else tuple()
-        tail_points = points[tail_indices] if tail_indices.size else np.empty((0, 2), dtype=np.float32)
-        tail_labels = tuple(str(labels_array[i]) for i in tail_indices) if labels_array.size else tuple()
-
-        if not core_labels:
-            core_labels = tuple(f"bp-{idx}" for idx in range(len(core_points)))
-        if not tail_labels and len(tail_points) > 0:
-            tail_labels = tuple(f"tail-{idx}" for idx in range(len(tail_points)))
-
-        return core_points, core_labels, tail_points, tail_labels
-
-    def _order_tail_sequence(
-        self,
-        base_point: np.ndarray,
-        tail_points: np.ndarray,
-        tail_labels: Tuple[str, ...],
-    ) -> Tuple[np.ndarray, Tuple[str, ...]]:
-        if tail_points.size == 0:
-            return tail_points.astype(np.float32, copy=False), tail_labels
-
-        points = tail_points.astype(np.float32, copy=False)
-        if tail_labels:
-            label_list = list(tail_labels)
-        else:
-            label_list = [f"tail-{idx}" for idx in range(len(points))]
-
-        remaining = list(range(len(points)))
-        ordered_indices: List[int] = []
-
-        start_idx = min(remaining, key=lambda idx: float(np.linalg.norm(points[idx] - base_point)))
-        ordered_indices.append(start_idx)
-        remaining.remove(start_idx)
-
-        while remaining:
-            last_point = points[ordered_indices[-1]]
-            next_idx = min(remaining, key=lambda idx: float(np.linalg.norm(points[idx] - last_point)))
-            ordered_indices.append(next_idx)
-            remaining.remove(next_idx)
-
-        ordered_points = points[ordered_indices]
-        ordered_labels = tuple(label_list[idx] for idx in ordered_indices)
-        return ordered_points, ordered_labels
-
-    def _build_tail_polyline(
-        self,
-        mouse_id: str,
-        base_point: np.ndarray,
-        tail_points: np.ndarray,
-    ) -> Optional[np.ndarray]:
-        if tail_points.size == 0:
-            return None
-
-        base_point_f32 = base_point.astype(np.float32)
-        points = tail_points.astype(np.float32, copy=False)
-        if np.linalg.norm(points[0] - base_point_f32) < 1e-6:
-            chain = points
-        else:
-            chain = np.vstack((base_point_f32[None, :], points))
-
-        if len(chain) <= 2:
-            return chain
-
-        samples_per_segment = max(10, min(36, len(chain) * 8))
-        return self._cubic_bezier_chain(chain, samples_per_segment)
-
-    def _draw_whiskers(
-        self,
-        anchor_point: np.ndarray,
-        nose_point: np.ndarray,
-        base_color: Tuple[float, float, float],
-    ) -> None:
-        direction = nose_point - anchor_point
-        norm = float(np.linalg.norm(direction))
-        if norm < 1e-5:
-            direction_unit = np.array([1.0, 0.0], dtype=np.float32)
-        else:
-            direction_unit = direction / norm
-
-        whisker_length = min(max(norm * 0.85, 18.0), 48.0)
-        whisker_angles = (-0.55, -0.3, 0.3, 0.55)
-        accent_color = self._lighten_color(base_color, 0.55)
-        underline_color = self._lighten_color(base_color, 0.2)
-        segments: List[Tuple[np.ndarray, np.ndarray]] = []
-        for angle in whisker_angles:
-            oriented = self._rotate_vector(direction_unit, angle)
-            tip = nose_point + oriented * whisker_length
-            segments.append((nose_point.astype(np.float32), tip.astype(np.float32)))
-
-        if segments:
-            self._scene_add_whiskers(
-                segments,
-                primary_color=accent_color,
-                secondary_color=underline_color,
-            )
-
-    def _draw_mouse_group(
-        self,
-        mouse_id: str,
-        group: MouseGroup,
-        base_color: Tuple[float, float, float],
-    ) -> None:
-        points = group.points
-        if len(points) == 0:
-            return
-
-        core_points, core_labels, tail_points, tail_labels = self._split_tail_points(group)
-        body_points = core_points if len(core_points) > 0 else points
-        anchor_point = body_points.mean(axis=0) if len(body_points) > 0 else points.mean(axis=0)
-
-        hull = self._convex_hull(core_points) if len(core_points) >= 3 else None
-
-        nose_point: Optional[np.ndarray] = None
-        if group.labels:
-            for idx, label in enumerate(group.labels):
-                if "nose" in str(label).lower():
-                    nose_point = points[idx]
-                    break
-
-        sorted_tail_points: Optional[np.ndarray] = None
-        sorted_tail_labels: Optional[Tuple[str, ...]] = None
-        connection_point = anchor_point
-        if len(tail_points) > 0:
-            sorted_tail_points, sorted_tail_labels = self._order_tail_sequence(anchor_point, tail_points, tail_labels)
-            tail_start_index = 0
-            if hull is not None and len(hull) >= 3:
-                connection_point, tail_start_index = self._tail_base_connection(sorted_tail_points, hull)
-            elif len(body_points) > 0:
-                tail_start_index = self._nearest_tail_index_to_body(sorted_tail_points, body_points)
-                nearest_body = body_points
-                if len(nearest_body) > 0:
-                    dists = np.linalg.norm(nearest_body - sorted_tail_points[tail_start_index], axis=1)
-                    body_idx = int(np.argmin(dists))
-                    connection_point = nearest_body[body_idx].astype(np.float32)
-            if tail_start_index > 0 and sorted_tail_points is not None and len(sorted_tail_points) > 0:
-                sorted_tail_points = np.concatenate(
-                    (sorted_tail_points[tail_start_index:], sorted_tail_points[:tail_start_index]),
-                    axis=0,
-                )
-                if sorted_tail_labels is not None:
-                    labels_list = list(sorted_tail_labels)
-                    rotated = labels_list[tail_start_index:] + labels_list[:tail_start_index]
-                    sorted_tail_labels = tuple(rotated)
-
-        glow_points = points.astype(np.float32)
-        self._scene_add_glow(glow_points, color=base_color)
-
-        if len(body_points) > 0:
-            self._scene_add_body(
-                body_points.astype(np.float32),
-                base_color=base_color,
-                labels=core_labels,
-                mouse_id=mouse_id,
-                edge_color=(1.0, 1.0, 1.0),
-            )
-
-        label_color = self._lighten_color(base_color, 0.35)
-        border_color = self._lighten_color(base_color, 0.15)
-        self._scene_add_label(
-            f"Mouse {mouse_id}",
-            anchor_point.astype(np.float32),
-            glow_points,
-            color=label_color,
-            border_color=border_color,
-        )
-
-        if nose_point is not None:
-            self._draw_whiskers(anchor_point, nose_point, base_color)
-
-        if sorted_tail_points is not None and len(sorted_tail_points) > 0:
-            if sorted_tail_labels is None:
-                sorted_tail_labels = tuple(f"tail-{idx}" for idx in range(len(sorted_tail_points)))
-            tail_face = self._lighten_color(base_color, 0.35)
-            self._scene_add_tail(
-                sorted_tail_points.astype(np.float32),
-                base_color=tail_face,
-                labels=sorted_tail_labels,
-                mouse_id=mouse_id,
-                edge_color=base_color,
-            )
-            polyline = self._build_tail_polyline(mouse_id, connection_point, sorted_tail_points)
-            if polyline is not None and len(polyline) >= 2:
-                self._scene_add_tail_polyline(
-                    polyline.astype(np.float32),
-                    primary_color=self._lighten_color(base_color, 0.35),
-                    secondary_color=base_color,
-                )
-
-        cluster_for_edges = core_points
-        if len(cluster_for_edges) >= 2:
-            edges = self._minimum_spanning_edges(cluster_for_edges)
-            segments = [
-                (
-                    np.asarray([x1, y1], dtype=np.float32),
-                    np.asarray([x2, y2], dtype=np.float32),
-                )
-                for (x1, y1), (x2, y2) in edges
-            ]
-            if segments:
-                edge_color = self._lighten_color(base_color, 0.05)
-                self._scene_add_edges(segments, color=edge_color)
-
-        if hull is not None and len(hull) >= 3:
-            fill_color = self._lighten_color(base_color, 0.45)
-            self._scene_add_hull(hull.astype(np.float32), color=fill_color)
-
-    def _draw_trail(self, mouse_id: str, base_color: Tuple[float, float, float]) -> None:
-        trail_points = self.trail_cache.get(mouse_id)
-        if not trail_points or len(trail_points) < 2:
-            return
-
-        segment_count = min(len(trail_points), self.trail_visual_length)
-        recent_points = trail_points[-segment_count:]
-        if len(recent_points) < 2:
-            return
-
-        alphas = np.linspace(0.12, 0.48, len(recent_points))
-        lightened = self._lighten_color(base_color, 0.12)
-        segments = []
-        for (x1, y1), (x2, y2), alpha in zip(recent_points[:-1], recent_points[1:], alphas[1:]):
-            start = np.asarray([x1, y1], dtype=np.float32)
-            end = np.asarray([x2, y2], dtype=np.float32)
-            segments.append((start, end, float(alpha * 0.7)))
-
-        if segments:
-            self._scene_add_trail(segments, color=lightened)
 
 
 __all__ = ["PoseViewerPlaybackMixin"]

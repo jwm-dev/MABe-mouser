@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from vispy import app, scene
@@ -20,8 +20,12 @@ except Exception:  # pragma: no cover - PyQt not installed
 	QtCore = None
 	QtWidgets = None
 
+from .camera import PoseSceneCameraMixin
 from .constants import UI_ACCENT, UI_BACKGROUND, UI_SURFACE, UI_TEXT_MUTED, UI_TEXT_PRIMARY
+from .lighting import add_glow_markers as lighting_add_glow_markers, initialise_lighting_visuals
 from .optional_dependencies import qtawesome
+from .scene_types import HoverDataset, LabelDefinition, SceneRect
+from .visual_utils import ColorInput, _ensure_3d, _rgba, to_rgb, to_rgba
 
 
 app.use_app("pyqt6")
@@ -49,8 +53,6 @@ TAB20_RGB: Tuple[Tuple[float, float, float], ...] = (
 	(0.090196078, 0.745098039, 0.811764706),
 	(0.619607843, 0.854901961, 0.898039216),
 )
-
-
 GOLDEN_ANGLE_RADIANS = math.radians(137.50776405003785)
 LABEL_MAX_ATTEMPTS = 18
 LABEL_RADIUS_SCALES: Tuple[float, ...] = (1.0, 1.25, 1.55, 1.9, 2.45)
@@ -58,203 +60,7 @@ LABEL_OVERLAP_PADDING = 6.0
 LABEL_TEXT_LINE_HEIGHT = 1.32
 LABEL_TEXT_WIDTH_FACTOR = 0.62
 LABEL_TEXT_EXTRA_CHARS = 1.4
-
-
-ColorInput = Union[str, Sequence[float], Sequence[int], np.ndarray]
-
-_COLOR_NAME_MAP: Dict[str, Tuple[float, float, float]] = {
-	"black": (0.0, 0.0, 0.0),
-	"white": (1.0, 1.0, 1.0),
-	"red": (1.0, 0.0, 0.0),
-	"green": (0.0, 0.5, 0.0),
-	"blue": (0.0, 0.0, 1.0),
-	"yellow": (1.0, 1.0, 0.0),
-	"cyan": (0.0, 1.0, 1.0),
-	"magenta": (1.0, 0.0, 1.0),
-	"orange": (1.0, 0.55, 0.0),
-	"purple": (0.5, 0.0, 0.5),
-	"gray": (0.5, 0.5, 0.5),
-	"grey": (0.5, 0.5, 0.5),
-}
-
-
-def _normalize_channel(value: Union[float, int]) -> float:
-	val = float(value)
-	if val > 1.0:
-		val /= 255.0
-	return max(0.0, min(1.0, val))
-
-
-def _parse_hex_color(text: str) -> Tuple[float, float, float, Optional[float]]:
-	hex_digits = text.lstrip("#").strip()
-	if len(hex_digits) in {3, 4}:
-		hex_digits = "".join(ch * 2 for ch in hex_digits)
-	if len(hex_digits) == 6:
-		r = int(hex_digits[0:2], 16)
-		g = int(hex_digits[2:4], 16)
-		b = int(hex_digits[4:6], 16)
-		return (
-			_normalize_channel(r),
-			_normalize_channel(g),
-			_normalize_channel(b),
-			None,
-		)
-	if len(hex_digits) == 8:
-		r = int(hex_digits[0:2], 16)
-		g = int(hex_digits[2:4], 16)
-		b = int(hex_digits[4:6], 16)
-		a = int(hex_digits[6:8], 16)
-		return (
-			_normalize_channel(r),
-			_normalize_channel(g),
-			_normalize_channel(b),
-			_normalize_channel(a),
-		)
-	raise ValueError(f"Unsupported hex color '{text}'")
-
-
-def to_rgb(color: ColorInput) -> Tuple[float, float, float]:
-	if isinstance(color, str):
-		text = color.strip().lower()
-		if text in {"none", "transparent"}:
-			return (0.0, 0.0, 0.0)
-		if text.startswith("#"):
-			r, g, b, _ = _parse_hex_color(text)
-			return (r, g, b)
-		if text in _COLOR_NAME_MAP:
-			return _COLOR_NAME_MAP[text]
-		raise ValueError(f"Unrecognised color string '{color}'")
-
-	if isinstance(color, np.ndarray):
-		flat = color.flatten()
-	else:
-		flat = list(color)  # type: ignore[arg-type]
-
-	if len(flat) == 4:
-		flat = flat[:3]
-	if len(flat) != 3:
-		raise ValueError(f"Cannot convert value '{color}' to RGB")
-
-	r, g, b = (_normalize_channel(chan) for chan in flat)
-	return (float(r), float(g), float(b))
-
-
-def to_rgba(color: ColorInput, *, alpha: Optional[float] = None) -> Tuple[float, float, float, float]:
-	if isinstance(color, str):
-		text = color.strip().lower()
-		if text in {"none", "transparent"}:
-			return (0.0, 0.0, 0.0, 0.0 if alpha is None else _normalize_channel(alpha))
-		if text.startswith("#"):
-			r, g, b, parsed_alpha = _parse_hex_color(text)
-			return (
-				r,
-				g,
-				b,
-				float(_normalize_channel(parsed_alpha if parsed_alpha is not None else (1.0 if alpha is None else alpha))),
-			)
-		if text in _COLOR_NAME_MAP:
-			r, g, b = _COLOR_NAME_MAP[text]
-			return (r, g, b, float(_normalize_channel(1.0 if alpha is None else alpha)))
-		raise ValueError(f"Unrecognised color string '{color}'")
-
-	if isinstance(color, np.ndarray):
-		flat = color.flatten()
-	else:
-		flat = list(color)  # type: ignore[arg-type]
-
-	if len(flat) == 4:
-		r, g, b, a = flat
-		return (
-			float(_normalize_channel(r)),
-			float(_normalize_channel(g)),
-			float(_normalize_channel(b)),
-			float(_normalize_channel(alpha if alpha is not None else a)),
-		)
-	if len(flat) == 3:
-		r, g, b = flat
-		return (
-			float(_normalize_channel(r)),
-			float(_normalize_channel(g)),
-			float(_normalize_channel(b)),
-			float(_normalize_channel(1.0 if alpha is None else alpha)),
-		)
-	raise ValueError(f"Cannot convert value '{color}' to RGBA")
-
-
-def _ensure_3d(points: np.ndarray) -> np.ndarray:
-	arr = np.asarray(points, dtype=np.float32)
-	if arr.ndim == 1:
-		arr = arr.reshape(1, -1)
-	if arr.shape[1] == 2:
-		zeros = np.zeros((arr.shape[0], 1), dtype=np.float32)
-		arr = np.concatenate((arr.astype(np.float32, copy=False), zeros), axis=1)
-	elif arr.shape[1] == 1:
-		zeros = np.zeros((arr.shape[0], 2), dtype=np.float32)
-		arr = np.concatenate((arr.astype(np.float32, copy=False), zeros), axis=1)
-	elif arr.shape[1] > 3:
-		arr = arr[:, :3]
-	return arr.astype(np.float32, copy=False)
-
-
-def _rgba(color: ColorInput, alpha: Optional[float] = None) -> np.ndarray:
-	return np.array(to_rgba(color, alpha=alpha), dtype=np.float32)
-
-
-@dataclass
-class HoverDataset:
-	positions: np.ndarray
-	labels: Sequence[str]
-	mouse_id: str
-	screen_positions: Optional[np.ndarray] = None
-
-
-@dataclass
-class LabelDefinition:
-	text: str
-	anchor: np.ndarray
-	points: np.ndarray
-	color: Tuple[float, float, float]
-	border_color: Tuple[float, float, float]
-
-
-@dataclass(frozen=True)
-class SceneRect:
-	x: float
-	y: float
-	width: float
-	height: float
-
-	@staticmethod
-	def from_limits(xlim: Tuple[float, float], ylim: Tuple[float, float]) -> "SceneRect":
-		x0, x1 = (float(xlim[0]), float(xlim[1]))
-		y0, y1 = (float(ylim[0]), float(ylim[1]))
-		x_min = min(x0, x1)
-		y_min = min(y0, y1)
-		return SceneRect(
-			x=x_min,
-			y=y_min,
-			width=max(abs(x1 - x0), 0.0),
-			height=max(abs(y1 - y0), 0.0),
-		)
-
-	@property
-	def xlim(self) -> Tuple[float, float]:
-		return (self.x, self.x + self.width)
-
-	@property
-	def ylim(self) -> Tuple[float, float]:
-		return (self.y, self.y + self.height)
-
-	@property
-	def center(self) -> Tuple[float, float]:
-		return (self.x + self.width * 0.5, self.y + self.height * 0.5)
-
-	@property
-	def aspect(self) -> float:
-		height = max(self.height, 1e-9)
-		return float(self.width / height)
-
-class PoseScene:
+class PoseScene(PoseSceneCameraMixin):
 	def __init__(
 		self,
 		*,
@@ -303,32 +109,7 @@ class PoseScene:
 			pass
 
 
-		camera = scene.cameras.PanZoomCamera(aspect=1.0, rect=(0.0, 0.0, 1.0, 1.0))
-		camera.interactive = True
-		camera.keep_aspect = True
-		self.view.camera = camera
-		self.view.camera.set_range(x=(0.0, 1.0), y=(0.0, 1.0), margin=0.0)
-		self.view.camera.aspect = 1.0
-		self.view.camera.flip = (False, False, False)
-		self.view.scene.transform.changed.connect(self._on_scene_transform_change)
-		self.view.camera.events.transform_change.connect(self._on_camera_transform_change)
-		self.view.camera.events.mouse_wheel.connect(self._on_camera_interaction)
-		self.view.camera.events.mouse_move.connect(self._on_camera_interaction)
-		self.view.camera.events.mouse_press.connect(self._on_camera_interaction)
-		self.view.camera.events.mouse_release.connect(self._on_camera_interaction)
-		self.view.events.mouse_wheel.connect(self._on_view_mouse_wheel)
-		self.view.events.mouse_press.connect(self._on_view_mouse_event)
-		self.view.events.mouse_release.connect(self._on_view_mouse_event)
-		self.view.events.mouse_move.connect(self._on_view_mouse_event)
-
-		self.canvas.events.resize.connect(self._on_resize)
-		self.canvas.events.mouse_move.connect(self._on_mouse_move)
-		self.canvas.events.mouse_wheel.connect(self._on_canvas_mouse_wheel)
-		self.view.events.resize.connect(self._on_view_resize)
-
-		self._device_pixel_ratio = 1.0
-		self._viewport_size = (float(width), float(height))
-		self._qt_resize_watcher: Optional[Any] = None
+		self._initialise_camera(width=float(width), height=float(height))
 
 		self._raw_xlim = (0.0, 1.0)
 		self._raw_ylim = (0.0, 1.0)
@@ -353,12 +134,6 @@ class PoseScene:
 		self._hover_datasets: List[HoverDataset] = []
 		self._hover_threshold_px = 16.0
 		self._in_layout_update = False
-		self._in_view_resize = False
-		self._in_camera_update = False
-		self._user_camera_override = False
-		self._override_view_rect: Optional[SceneRect] = None
-		self._pending_user_camera_override = False
-		self._camera_change_callback: Optional[Callable[[SceneRect, bool], None]] = None
 		self._unit_scale = 1.0
 		self._unit_label = "pixels"
 		self._x_axis_label = ""
@@ -385,13 +160,7 @@ class PoseScene:
 		)
 		self._hover_text.visible = False
 
-		self._glow_markers = visuals.Markers(parent=self.view.scene)
-		self._glow_markers.set_gl_state(
-			blend=True,
-			depth_test=False,
-			blend_func=("src_alpha", "one"),
-		)
-		self._glow_markers.antialias = 4
+		initialise_lighting_visuals(self)
 
 		self._body_markers = visuals.Markers(parent=self.view.scene)
 		self._body_markers.set_gl_state("translucent", depth_test=False)
@@ -477,6 +246,13 @@ class PoseScene:
 		self._label_bounds: List[Tuple[float, float, float, float]] = []
 		self._label_definitions: List[LabelDefinition] = []
 		self._label_layout_dirty = False
+		self._label_font_size = 11.0
+		self._label_text_pool: List[visuals.Text] = []
+		self._label_layout_timer = app.Timer(
+			interval=0.0,
+			connect=self._on_label_layout_timer,
+			start=False,
+		)
 
 		self._update_layout_for_dimensions()
 		self.reset_frame_state()
@@ -523,9 +299,14 @@ class PoseScene:
 
 		self._label_line_segments: List[np.ndarray] = []
 		self._label_line_colors: List[np.ndarray] = []
+		self._release_active_labels()
 		self._label_bounds = []
 		self._label_definitions = []
 		self._label_layout_dirty = False
+		try:
+			self._label_layout_timer.stop()
+		except Exception:
+			pass
 
 		self._hover_datasets = []
 
@@ -535,12 +316,6 @@ class PoseScene:
 	@property
 	def unit_label(self) -> str:
 		return self._unit_label
-
-	@property
-	def has_user_camera_override(self) -> bool:
-		value = bool(self._user_camera_override)
-		print(f"[PoseScene] has_user_camera_override -> {value}")
-		return value
 
 	def set_unit_scale(self, *, cm_per_pixel: Optional[float]) -> None:
 		print(f"[PoseScene] set_unit_scale requested cm_per_pixel={cm_per_pixel}")
@@ -580,11 +355,6 @@ class PoseScene:
 		if value is None:
 			return None
 		return float(value) * self._unit_scale
-
-	def _to_scene_units_pair(self, pair: Tuple[Optional[float], Optional[float]]) -> Tuple[Optional[float], Optional[float]]:
-		left = self._to_scene_units_scalar(pair[0])
-		right = self._to_scene_units_scalar(pair[1])
-		return (left, right)
 
 	def _to_scene_units_array(self, array: np.ndarray) -> np.ndarray:
 		if array.size == 0:
@@ -820,15 +590,6 @@ class PoseScene:
 				return float(ratio)
 		return 1.0
 
-	def _effective_viewport_size(self) -> Optional[Tuple[float, float]]:
-		view_size = self._size_to_pair(getattr(self.view, "size", None))
-		if view_size is not None and view_size[0] > 1e-3 and view_size[1] > 1e-3:
-			return (float(view_size[0]), float(view_size[1]))
-		canvas_w, canvas_h = self._viewport_size
-		if canvas_w > 1e-3 and canvas_h > 1e-3:
-			return (float(canvas_w), float(canvas_h))
-		return None
-
 	def _update_layout_for_dimensions(self) -> None:
 		if self._in_layout_update:
 			return
@@ -845,16 +606,6 @@ class PoseScene:
 			if hasattr(native_widget, "updateGeometry"):
 				native_widget.updateGeometry()
 			self._view_aspect_ratio = self._safe_ratio(canvas_w, canvas_h)
-			target = self._target_aspect_ratio if (self._target_aspect_ratio and math.isfinite(self._target_aspect_ratio) and self._target_aspect_ratio > 0.0) else (self._view_aspect_ratio or 1.0)
-			self._letterbox_state = {
-				"left": 0.0,
-				"right": 0.0,
-				"top": 0.0,
-				"bottom": 0.0,
-				"data_width": canvas_w,
-				"data_height": canvas_h,
-				"target_aspect": target,
-			}
 		finally:
 			self._in_layout_update = False
 		self._update_scale_bar()
@@ -1130,91 +881,6 @@ class PoseScene:
 		new_y = rect_center_y - half_h
 		return SceneRect(new_x, new_y, width, height)
 
-	def on_camera_change(self, callback: Optional[Callable[[SceneRect, bool, str], None]]) -> None:
-		self._camera_change_callback = callback
-
-	def _emit_camera_change(self, *, source: str = "system") -> None:
-		if self._camera_change_callback and self._current_view_rect is not None:
-			callback = self._camera_change_callback
-			try:
-				callback(self._current_view_rect, bool(self._user_camera_override), source)
-			except TypeError:
-				callback(self._current_view_rect, bool(self._user_camera_override))
-
-	def _set_camera_rect(
-		self,
-		rect: SceneRect,
-		*,
-		flip_x: bool,
-		flip_y: bool,
-		update_override: bool = False,
-	) -> None:
-		print(
-			f"[PoseScene] _set_camera_rect rect={rect} flip=({flip_x},{flip_y}) update_override={update_override}"
-		)
-		camera = getattr(self.view, "camera", None)
-		if camera is None:
-			return
-		center_x, center_y = rect.center
-		x_min = rect.x
-		y_min = rect.y
-		x_max = rect.x + rect.width
-		y_max = rect.y + rect.height
-		self._in_camera_update = True
-		try:
-			camera.set_range(x=(x_min, x_max), y=(y_min, y_max), z=(0.0, 1.0), margin=0.0)
-			camera.flip = (flip_x, flip_y, False)
-			camera.center = (center_x, center_y, 0.0)
-			try:
-				camera.rect = (x_min, y_min, rect.width, rect.height)
-			except AttributeError:
-				pass
-		finally:
-			self._in_camera_update = False
-		camera.aspect = float(rect.width / rect.height) if rect.height > 0.0 else None
-		self._current_view_rect = rect
-		if update_override:
-			self._override_view_rect = rect
-		self._update_axes_for_rect(rect)
-		self._update_frame_border()
-		try:
-			transform = self.view.scene.transform
-			origin = transform.map([x_min, y_min, 0.0])
-			x_axis_point = transform.map([x_max, y_min, 0.0])
-			y_axis_point = transform.map([x_min, y_max, 0.0])
-			x_pixels = float(np.linalg.norm(x_axis_point[:2] - origin[:2]))
-			y_pixels = float(np.linalg.norm(y_axis_point[:2] - origin[:2]))
-			view_size = getattr(self.view, "size", None)
-			print(
-				f"[PoseScene] camera rect=({x_min:.1f},{x_max:.1f})×({y_min:.1f},{y_max:.1f}) size=({rect.width:.1f}×{rect.height:.1f}) flip=({flip_x},{flip_y}) px=({x_pixels:.1f}×{y_pixels:.1f}) view_size={view_size}"
-			)
-		except Exception:
-			pass
-		self._refresh_hover_cache()
-		if not self._in_layout_update:
-			self._update_layout_for_dimensions()
-		self._emit_camera_change(source="system")
-		print(
-			f"[PoseScene] _set_camera_rect done current_rect={self._current_view_rect} override={self._override_view_rect}"
-		)
-
-	def apply_camera_rect(self, rect: SceneRect, *, as_user_override: bool = True) -> SceneRect:
-		print(f"[PoseScene] apply_camera_rect rect={rect} as_user_override={as_user_override}")
-		bounds = self._scene_rect or rect
-		clamped = self._clamp_rect_to_bounds(rect, bounds)
-		self._pending_user_camera_override = False
-		self._user_camera_override = bool(as_user_override)
-		self._override_view_rect = clamped if as_user_override else None
-		self._set_camera_rect(clamped, flip_x=self._x_axis_flipped, flip_y=self._y_axis_flipped)
-		return clamped
-
-	def reset_camera_view(self) -> None:
-		print("[PoseScene] reset_camera_view called; clearing overrides")
-		self._pending_user_camera_override = False
-		self._user_camera_override = False
-		self._override_view_rect = None
-		self._apply_geometry()
-		self.request_draw()
 
 	def _scene_to_canvas_transform(self) -> Optional[Any]:
 		try:
@@ -1819,109 +1485,7 @@ class PoseScene:
 		self._label_line_segments.clear()
 		self._label_line_colors.clear()
 
-	def add_glow_markers(self, positions: np.ndarray, *, base_color: Sequence[float]) -> None:
-		if positions.size == 0:
-			return
-		positions_scene = self._to_scene_units_array(positions).astype(np.float32, copy=False)
-		count = positions_scene.shape[0]
-		if count == 0:
-			return
-
-		base_rgb = np.clip(np.array(to_rgb(base_color), dtype=np.float32), 0.0, 1.0)
-		view_rect = self._current_view_rect or self._base_view_rect or self._scene_rect
-		if view_rect is not None:
-			span = float(max(getattr(view_rect, "width", 0.0), getattr(view_rect, "height", 0.0), 1.0))
-		else:
-			span = float(
-				max(
-					float(np.ptp(positions_scene[:, 0]) if count > 1 else 1.0),
-					float(np.ptp(positions_scene[:, 1]) if count > 1 else 1.0),
-					1.0,
-				)
-			)
-		scene_rect = self._scene_rect or view_rect
-		baseline_span = float(max(getattr(scene_rect, "width", span), getattr(scene_rect, "height", span), span)) if scene_rect is not None else span
-		zoom_level = float(np.clip(baseline_span / max(span, 1e-3), 0.2, 5.0))
-
-		density = np.zeros((count,), dtype=np.float32)
-		scale_reference = 1.0
-		if count > 1:
-			diff = positions_scene[:, None, :2] - positions_scene[None, :, :2]
-			dist_sq = np.sum(diff * diff, axis=2).astype(np.float32, copy=False)
-			mask = ~np.eye(count, dtype=bool)
-			valid = dist_sq[mask]
-			positive = valid[valid > 1e-6]
-			if positive.size > 0:
-				scale_reference = float(np.median(positive))
-			elif valid.size > 0:
-				scale_reference = float(np.mean(valid))
-			if not math.isfinite(scale_reference) or scale_reference <= 1e-6:
-				scale_reference = 1.0
-			sigma = max(math.sqrt(scale_reference) * 0.7 + 14.0, 5.5)
-			sigma_sq = max(sigma * sigma, 1.0)
-			influence = np.exp(-dist_sq / sigma_sq).astype(np.float32, copy=False)
-			np.fill_diagonal(influence, 0.0)
-			density = influence.sum(axis=1).astype(np.float32, copy=False)
-
-		if density.size > 0:
-			max_d = float(np.max(density))
-			min_d = float(np.min(density))
-			if max_d - min_d > 1e-6:
-				density = (density - min_d) / (max_d - min_d)
-			else:
-				density.fill(0.0)
-
-		density_gamma = density.astype(np.float32, copy=False) ** 0.72
-		global_density = float(np.mean(density_gamma)) if count else 0.0
-		max_density = float(np.max(density_gamma)) if count else 0.0
-		global_penalty = float(np.clip(1.0 / (1.0 + global_density * 1.8 + max_density * 1.25), 0.15, 0.8))
-		camera_intensity = float(np.clip(0.26 + zoom_level ** 0.65 * 0.32, 0.22, 0.85))
-		density_penalty = 1.0 / (1.0 + density_gamma * (0.82 + 0.28 * camera_intensity))
-		density_penalty = density_penalty.astype(np.float32, copy=False)
-		brightness_scale = camera_intensity * global_penalty * 0.46
-		size_scale = float(np.clip(np.interp(zoom_level, [0.2, 1.0, 3.5, 5.0], [2.4, 1.0, 0.65, 0.5]), 0.45, 2.6))
-		spacing_scale = float(np.clip(math.sqrt(scale_reference), 0.75, 5.0)) if scale_reference > 0.0 else 1.0
-		base_size = np.clip(54.0 * size_scale * spacing_scale ** 0.28, 16.0, 200.0)
-		base_rgb_broadcast = np.tile(base_rgb, (count, 1)).astype(np.float32, copy=False)
-		base_mean = float(np.mean(base_rgb))
-		color_offset = (base_rgb - base_mean).astype(np.float32, copy=False)
-		offset = color_offset.reshape(1, 3)
-		core_gain = (0.72 + density_gamma[:, None] * 0.05 + camera_intensity * 0.04).astype(np.float32, copy=False)
-		core_rgb = np.clip(
-			base_rgb_broadcast * core_gain
-			+ offset * (0.32 + density_gamma[:, None] * 0.18),
-			0.0,
-			1.0,
-		)
-		highlight_bias = np.array([0.17, 0.15, 0.11], dtype=np.float32)
-		highlight_rgb = np.clip(
-			base_rgb_broadcast * (0.54 + camera_intensity * 0.05)
-			+ offset * (0.55 + density_gamma[:, None] * 0.22)
-			+ highlight_bias[None, :],
-			0.0,
-			1.0,
-		)
-		sat_factor = np.clip(1.08 + density_gamma[:, None] * 0.18 + camera_intensity * 0.06, 1.0, 1.34).astype(np.float32, copy=False)
-		layer_specs = (
-			(0.58, 0.22, 0.0),
-			(1.12, 0.11, 0.25),
-			(1.85, 0.055, 0.47),
-			(2.65, 0.028, 0.74),
-		)
-		for radius_scale, alpha_base, mix_bias in layer_specs:
-			mix = np.clip(mix_bias + density_gamma * 0.17, 0.0, 1.0)
-			color_rgb = (1.0 - mix)[:, None] * core_rgb + mix[:, None] * highlight_rgb
-			grey = np.mean(color_rgb, axis=1, keepdims=True).astype(np.float32, copy=False)
-			color_rgb = grey + (color_rgb - grey) * sat_factor
-			color_rgb = np.clip(color_rgb * 0.64 + base_rgb[None, :] * 0.36, 0.0, 1.0)
-			layer_alpha = np.clip(alpha_base * brightness_scale * density_penalty, 0.003, 0.11)
-			size_array = np.clip(base_size * radius_scale * (0.82 + density_gamma * 0.24), 8.0, 220.0).astype(np.float32, copy=False)
-			color_array = np.empty((count, 4), dtype=np.float32)
-			color_array[:, :3] = color_rgb.astype(np.float32, copy=False)
-			color_array[:, 3] = layer_alpha.astype(np.float32, copy=False)
-			self._glow_positions.append(positions_scene)
-			self._glow_sizes.append(size_array)
-			self._glow_colors.append(color_array)
+	add_glow_markers = lighting_add_glow_markers
 
 	def add_body_markers(
 		self,
@@ -2103,7 +1667,7 @@ class PoseScene:
 			border_color=border_tuple,
 		)
 		self._label_definitions.append(definition)
-		self._label_layout_dirty = True
+		self._request_label_layout()
 
 	def add_whisker_segments(
 		self,
@@ -2228,8 +1792,14 @@ class PoseScene:
 			y0, y1 = y1, y0
 		return (float(x0), float(y0), float(x1), float(y1))
 
-	def _scene_scale_at_point(self, point: Tuple[float, float]) -> Tuple[float, float]:
-		transform = self._scene_to_canvas_transform()
+	def _scene_scale_at_point(
+		self,
+		point: Tuple[float, float],
+		*,
+		transform: Optional[Any] = None,
+	) -> Tuple[float, float]:
+		if transform is None:
+			transform = self._scene_to_canvas_transform()
 		if transform is None:
 			return (1.0, 1.0)
 		x, y = point
@@ -2260,6 +1830,34 @@ class PoseScene:
 		a_x0, a_y0, a_x1, a_y1 = a
 		b_x0, b_y0, b_x1, b_y1 = b
 		return not (a_x1 <= b_x0 or a_x0 >= b_x1 or a_y1 <= b_y0 or a_y0 >= b_y1)
+
+	def _acquire_label_visual(self, definition: LabelDefinition) -> visuals.Text:
+		if self._label_text_pool:
+			label = self._label_text_pool.pop()
+			label.text = definition.text
+			label.color = _rgba(definition.color, 0.95)
+			label.font_size = float(self._label_font_size)
+			label.parent = self.view.scene
+			label.visible = True
+			return label
+		return visuals.Text(
+			definition.text,
+			color=_rgba(definition.color, 0.95),
+			font_size=float(self._label_font_size),
+			parent=self.view.scene,
+		)
+
+	def _release_active_labels(self) -> None:
+		if not self._label_texts:
+			return
+		for text in self._label_texts:
+			try:
+				text.visible = False
+				text.parent = None
+			except Exception:
+				pass
+			self._label_text_pool.append(text)
+		self._label_texts.clear()
 
 	def add_label(
 		self,
@@ -2301,7 +1899,7 @@ class PoseScene:
 			border_color=border_tuple,
 		)
 		self._label_definitions.append(definition)
-		self._label_layout_dirty = True
+		self._request_label_layout()
 
 	def _point_in_view(self, point: Sequence[float]) -> bool:
 		view_rect = self._current_view_rect or self._base_view_rect or self._scene_rect
@@ -2326,7 +1924,7 @@ class PoseScene:
 			return False
 		return self._point_in_view(anchor)
 
-	def _layout_single_label(self, definition: LabelDefinition) -> None:
+	def _layout_single_label(self, definition: LabelDefinition, *, transform: Optional[Any] = None) -> None:
 		if not self._points_visible(definition.points, definition.anchor):
 			return
 		anchor_xy = definition.anchor.astype(np.float32, copy=False)
@@ -2338,13 +1936,9 @@ class PoseScene:
 			base_direction = (base_direction / norm).astype(np.float32, copy=False)
 		base_angle = math.atan2(float(base_direction[1]), float(base_direction[0]))
 		offset = self._label_offset_distance()
-		label = visuals.Text(
-			definition.text,
-			color=_rgba(definition.color, 0.95),
-			font_size=11,
-			parent=self.view.scene,
-		)
-		extent_px = self._estimate_text_extent(definition.text, float(label.font_size or 11.0))
+		label = self._acquire_label_visual(definition)
+		font_size = float(getattr(label, "font_size", self._label_font_size) or self._label_font_size)
+		extent_px = self._estimate_text_extent(definition.text, font_size)
 		best_bounds: Optional[Tuple[float, float, float, float]] = None
 		best_position: Optional[Tuple[float, float, float]] = None
 		best_anchor: Tuple[str, str] = ("center", "center")
@@ -2362,7 +1956,7 @@ class PoseScene:
 				anchor_x, anchor_y = self._label_anchor_for_direction(direction)
 				label.anchors = (anchor_x, anchor_y)
 				label.pos = (float(label_xy[0]), float(label_xy[1]), 0.0)
-				scale_x, scale_y = self._scene_scale_at_point((float(label_xy[0]), float(label_xy[1])))
+				scale_x, scale_y = self._scene_scale_at_point((float(label_xy[0]), float(label_xy[1])), transform=transform)
 				padding_scene = LABEL_OVERLAP_PADDING / max(min(scale_x, scale_y), 1e-6)
 				extent_scene = (extent_px[0] / scale_x, extent_px[1] / scale_y)
 				bounds = self._bounds_from_anchor((float(label_xy[0]), float(label_xy[1])), (anchor_x, anchor_y), extent_scene, padding_scene)
@@ -2381,7 +1975,7 @@ class PoseScene:
 			fallback_anchor = self._label_anchor_for_direction(base_direction)
 			label.anchors = fallback_anchor
 			label.pos = (float(anchor_xy[0]), float(anchor_xy[1]), 0.0)
-			scale_x, scale_y = self._scene_scale_at_point((float(anchor_xy[0]), float(anchor_xy[1])))
+			scale_x, scale_y = self._scene_scale_at_point((float(anchor_xy[0]), float(anchor_xy[1])), transform=transform)
 			padding_scene = LABEL_OVERLAP_PADDING / max(min(scale_x, scale_y), 1e-6)
 			extent_scene = (extent_px[0] / scale_x, extent_px[1] / scale_y)
 			best_bounds = self._bounds_from_anchor((float(anchor_xy[0]), float(anchor_xy[1])), fallback_anchor, extent_scene, padding_scene)
@@ -2390,7 +1984,7 @@ class PoseScene:
 		if best_position is None:
 			best_position = (float(anchor_xy[0]), float(anchor_xy[1]), 0.0)
 		if best_bounds is None:
-			scale_x, scale_y = self._scene_scale_at_point((float(best_position[0]), float(best_position[1])))
+			scale_x, scale_y = self._scene_scale_at_point((float(best_position[0]), float(best_position[1])), transform=transform)
 			padding_scene = LABEL_OVERLAP_PADDING / max(min(scale_x, scale_y), 1e-6)
 			extent_scene = (extent_px[0] / scale_x, extent_px[1] / scale_y)
 			best_bounds = self._bounds_from_anchor((float(best_position[0]), float(best_position[1])), best_anchor, extent_scene, padding_scene)
@@ -2407,12 +2001,39 @@ class PoseScene:
 		self._label_line_segments.append(line_segment)
 		self._label_line_colors.append(line_color)
 
+	def _on_label_layout_timer(self, event: Any) -> None:
+		try:
+			self._label_layout_timer.stop()
+		except Exception:
+			pass
+		if self._label_layout_dirty:
+			self._layout_labels()
+
+	def _request_label_layout(self, *, delay: float = 0.0) -> None:
+		self._label_layout_dirty = True
+		timer = getattr(self, "_label_layout_timer", None)
+		if timer is None:
+			self._layout_labels()
+			return
+		try:
+			timer.stop()
+		except Exception:
+			pass
+		interval = float(delay)
+		if interval <= 0.0:
+			interval = 1.0 / 120.0
+		timer.start(interval)
+
 	def _layout_labels(self) -> None:
+		timer = getattr(self, "_label_layout_timer", None)
+		if timer is not None:
+			try:
+				timer.stop()
+			except Exception:
+				pass
 		if not self._label_layout_dirty:
 			return
-		for text in self._label_texts:
-			text.parent = None
-		self._label_texts.clear()
+		self._release_active_labels()
 		self._label_bounds.clear()
 		self._label_line_segments.clear()
 		self._label_line_colors.clear()
@@ -2421,8 +2042,9 @@ class PoseScene:
 			self._label_lines.set_data(pos=np.zeros((0, 3), dtype=np.float32), color=np.zeros((0, 4), dtype=np.float32), width=0.0)
 			self._label_layout_dirty = False
 			return
+		transform = self._scene_to_canvas_transform()
 		for definition in self._label_definitions:
-			self._layout_single_label(definition)
+			self._layout_single_label(definition, transform=transform)
 		if self._label_line_segments:
 			segments = np.vstack(self._label_line_segments)
 			colors = np.vstack(self._label_line_colors)
@@ -2552,22 +2174,6 @@ class PoseScene:
 	def capture_frame(self) -> np.ndarray:
 		return self.canvas.render(alpha=False)
 
-	def get_camera_override_rect(self) -> Optional[SceneRect]:
-		return self._override_view_rect
-
-	def get_current_camera_rect(self) -> Optional[SceneRect]:
-		return self._current_view_rect
-
-	def _handle_native_resize(self, width: Union[int, float], height: Union[int, float], device_pixel_ratio: float) -> None:
-		logical_width = max(float(width), 1.0)
-		logical_height = max(float(height), 1.0)
-		self._device_pixel_ratio = max(float(device_pixel_ratio), 1.0)
-		self._viewport_size = (logical_width, logical_height)
-		self._update_reset_button_geometry(logical_width, logical_height)
-		self._update_square_layout()
-		self._apply_geometry()
-		self._refresh_hover_cache()
-
 	def _refresh_hover_cache(self) -> None:
 		if not self._hover_datasets:
 			return
@@ -2641,25 +2247,6 @@ class PoseScene:
 			self._hover_callback(payload)
 		self.request_draw()
 
-	def _on_canvas_mouse_wheel(self, event: Any) -> None:
-		delta = getattr(event, "delta", None)
-		print(f"[PoseScene] _on_canvas_mouse_wheel delta={delta}")
-
-	def _forward_event_to_camera(self, event: Any) -> bool:
-		camera = getattr(self.view, "camera", None)
-		if camera is None:
-			return False
-		handler = getattr(camera, "viewbox_mouse_event", None)
-		if handler is None:
-			return False
-		try:
-			handler(event)
-			self._on_camera_transform_change(event)
-			return True
-		except Exception as exc:  # pragma: no cover - diagnostic path
-			print(f"[PoseScene] _forward_event_to_camera error={exc!r}")
-			return False
-
 	def _describe_mouse_event(self, event: Any) -> str:
 		if event is None:
 			return "event=None"
@@ -2668,225 +2255,6 @@ class PoseScene:
 		handled = getattr(event, "handled", None)
 		return f"event={event_type} pos={pos} handled={handled}"
 
-	def _on_view_mouse_wheel(self, event: Any) -> None:
-		delta = getattr(event, "delta", None)
-		info = self._describe_mouse_event(event)
-		print(f"[PoseScene] _on_view_mouse_wheel delta={delta} {info}")
-		forwarded = self._forward_event_to_camera(event)
-		if forwarded:
-			updated = self._describe_mouse_event(event)
-			print(f"[PoseScene] _on_view_mouse_wheel forwarded -> {updated}")
-
-	def _on_view_mouse_event(self, event: Any) -> None:
-		info = self._describe_mouse_event(event)
-		print(f"[PoseScene] _on_view_mouse_event {info}")
-		if self._handle_scale_bar_mouse_event(event):
-			return
-		forwarded = self._forward_event_to_camera(event)
-		if forwarded:
-			updated = self._describe_mouse_event(event)
-			print(f"[PoseScene] _on_view_mouse_event forwarded -> {updated}")
-
-	def _on_camera_interaction(self, event: Optional[Any]) -> None:
-		event_name = None
-		if event is not None:
-			event_name = getattr(event, "type", None) or getattr(event, "name", None)
-			if event_name is None:
-				event_name = type(event).__name__
-		else:
-			event_name = "None"
-		print(f"[PoseScene] _on_camera_interaction event={event_name}")
-		self._on_camera_transform_change(event)
-
-	def _on_camera_transform_change(self, event: Optional[Any] = None) -> None:
-		print("[PoseScene] _on_camera_transform_change triggered")
-		if self._in_camera_update:
-			print("[PoseScene] _on_camera_transform_change ignored (in_camera_update)")
-			return
-		camera = getattr(self.view, "camera", None)
-		if camera is None:
-			print("[PoseScene] _on_camera_transform_change abort: camera missing")
-			return
-		base_rect = self._base_view_rect or self._scene_rect
-		if base_rect is None:
-			print("[PoseScene] _on_camera_transform_change abort: base_rect missing")
-			return
-
-		def _extract_rect(cam: Any) -> Optional[Tuple[float, float, float, float]]:
-			rect_val = getattr(cam, "rect", None)
-			if rect_val is not None:
-				try:
-					left = getattr(rect_val, "left", None)
-					bottom = getattr(rect_val, "bottom", None)
-					width = getattr(rect_val, "width", None)
-					height = getattr(rect_val, "height", None)
-					if hasattr(rect_val, "pos"):
-						pos = rect_val.pos
-					else:
-						pos = None
-					if hasattr(rect_val, "size"):
-						size = rect_val.size
-					else:
-						size = None
-					x_val = float(left if left is not None else (pos[0] if pos is not None and len(pos) >= 2 else 0.0))
-					y_val = float(bottom if bottom is not None else (pos[1] if pos is not None and len(pos) >= 2 else 0.0))
-					w_val = float(width if width is not None else (size[0] if size is not None and len(size) >= 2 else 0.0))
-					h_val = float(height if height is not None else (size[1] if size is not None and len(size) >= 2 else 0.0))
-					if math.isfinite(w_val) and math.isfinite(h_val) and w_val > 0.0 and h_val > 0.0:
-						return (x_val, y_val, w_val, h_val)
-				except Exception:
-					try:
-						sequence = tuple(float(rect_val[idx]) for idx in range(4))
-						if all(math.isfinite(v) for v in sequence[2:]):
-							return sequence
-					except Exception:
-						pass
-			try:
-				state = cam.get_state() if hasattr(cam, "get_state") else None
-			except Exception:
-				state = None
-			if isinstance(state, Mapping):
-				rect_state = state.get("rect")
-				if rect_state is not None:
-					try:
-						if len(rect_state) >= 4:
-							vals = tuple(float(rect_state[i]) for i in range(4))
-							if all(math.isfinite(v) for v in vals[2:]):
-								return vals
-					except Exception:
-						pass
-			try:
-				ranges = cam.get_range()
-			except Exception:
-				ranges = None
-			if isinstance(ranges, Mapping) and "x" in ranges and "y" in ranges:
-				try:
-					x0, x1 = ranges["x"]
-					y0, y1 = ranges["y"]
-					return (
-						float(x0),
-						float(y0),
-						float(x1) - float(x0),
-						float(y1) - float(y0),
-					)
-				except Exception:
-					return None
-			return None
-
-		rect = _extract_rect(camera)
-		if rect is None:
-			print("[PoseScene] _on_camera_transform_change abort: camera rect unavailable")
-			return
-		print(f"[PoseScene] _on_camera_transform_change camera_rect={rect} base_rect={base_rect}")
-
-		x, y, width, height = rect
-		width = max(float(width), 1e-9)
-		height = max(float(height), 1e-9)
-		cx = float(x) + width * 0.5
-		cy = float(y) + height * 0.5
-
-		base_width = max(base_rect.width, 1e-9)
-		base_height = max(base_rect.height, 1e-9)
-		updated = False
-		if width > base_width + 1e-6 or height > base_height + 1e-6:
-			width = base_width
-			height = base_height
-			updated = True
-
-		half_w = width * 0.5
-		half_h = height * 0.5
-		base_x0 = base_rect.x
-		base_y0 = base_rect.y
-		base_x1 = base_rect.x + base_rect.width
-		base_y1 = base_rect.y + base_rect.height
-
-		min_cx = base_x0 + half_w
-		max_cx = base_x1 - half_w
-		if max_cx >= min_cx:
-			clamped_cx = min(max(cx, min_cx), max_cx)
-		else:
-			clamped_cx = (base_x0 + base_x1) * 0.5
-		if abs(clamped_cx - cx) > 1e-6:
-			updated = True
-		cx = clamped_cx
-
-		min_cy = base_y0 + half_h
-		max_cy = base_y1 - half_h
-		if max_cy >= min_cy:
-			clamped_cy = min(max(cy, min_cy), max_cy)
-		else:
-			clamped_cy = (base_y0 + base_y1) * 0.5
-		if abs(clamped_cy - cy) > 1e-6:
-			updated = True
-		cy = clamped_cy
-
-		new_x = cx - half_w
-		new_y = cy - half_h
-		if abs(new_x - x) > 1e-6 or abs(new_y - y) > 1e-6:
-			updated = True
-
-		self._current_view_rect = SceneRect(new_x, new_y, width, height)
-		is_override = (
-			abs(new_x - base_rect.x) > 1e-6
-			or abs(new_y - base_rect.y) > 1e-6
-			or width < base_width - 1e-6
-			or height < base_height - 1e-6
-		)
-		previous_override = self._override_view_rect
-		if not self._in_camera_update:
-			if is_override:
-				self._override_view_rect = self._current_view_rect
-				if previous_override != self._override_view_rect:
-					print(f"[PoseScene] user override stored rect={self._override_view_rect}")
-			else:
-				if self._override_view_rect is not None:
-					print("[PoseScene] user override cleared (reverted to base rect)")
-				self._override_view_rect = None
-		self._user_camera_override = self._override_view_rect is not None
-		print(
-			f"[PoseScene] _on_camera_transform_change new_rect={self._current_view_rect} is_override={is_override} override_now={self._override_view_rect}"
-		)
-
-		self._update_axes_for_rect(self._current_view_rect)
-		if not updated:
-			self.show_scale_bar_hint()
-			self._label_layout_dirty = True
-			self._layout_labels()
-			self._refresh_hover_cache()
-			self.request_draw()
-			self._emit_camera_change(source="user")
-			return
-
-		self._in_camera_update = True
-		try:
-			camera.set_range(x=(new_x, new_x + width), y=(new_y, new_y + height), margin=0.0)
-			camera.center = (cx, cy, 0.0)
-			try:
-				camera.rect = (new_x, new_y, width, height)
-			except AttributeError:
-				pass
-		finally:
-			self._in_camera_update = False
-		self._update_axes_for_rect(self._current_view_rect)
-		self.show_scale_bar_hint()
-		self._label_layout_dirty = True
-		self._layout_labels()
-		self._refresh_hover_cache()
-		self.request_draw()
-		self._emit_camera_change(source="user")
-		print(
-			"[PoseScene] _on_camera_transform_change applied rect={self._current_view_rect} override={self._override_view_rect}"
-		)
-
-	def _on_view_resize(self, event: Any) -> None:
-		if self._in_view_resize:
-			return
-		self._in_view_resize = True
-		try:
-			self._update_square_layout()
-			self._apply_geometry()
-		finally:
-			self._in_view_resize = False
 
 
 def create_scene_canvas(
@@ -2944,49 +2312,16 @@ def create_scene_canvas(
 	return scene_controller
 
 
-def initialise_viewer_theme(overrides: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-	"""Vispy-based theme initialiser (kept for backwards compatibility)."""
-
-	params: Dict[str, Any] = {
-		"background": UI_BACKGROUND,
-		"grid": (0.105, 0.149, 0.247, 0.28),
-	}
-	if overrides:
-		params.update(dict(overrides))
-	return params
-
-
 def get_palette_color(index: int, palette: str = "tab20") -> Tuple[float, float, float]:
 	if palette.lower() != "tab20":
 		raise ValueError(f"Unsupported palette '{palette}' for Vispy renderer")
 	return TAB20_RGB[index % len(TAB20_RGB)]
 
-
-class _NoOpTemporaryRC:
-	def __enter__(self) -> None:
-		return None
-
-	def __exit__(self, exc_type, exc, tb) -> None:
-		return False
-
-
-def temporary_rc(overrides: Mapping[str, Any]) -> _NoOpTemporaryRC:
-	"""Compatibility shim for legacy Matplotlib rc-context usage."""
-
-	return _NoOpTemporaryRC()
-
-
-def is_interactive_backend() -> bool:
-	return True
-
-
 __all__ = [
 	"PoseScene",
+	"PoseSceneCameraMixin",
 	"create_scene_canvas",
-	"initialise_viewer_theme",
 	"get_palette_color",
-	"temporary_rc",
-	"is_interactive_backend",
 	"to_rgb",
 	"to_rgba",
 ]
