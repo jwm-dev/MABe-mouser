@@ -63,16 +63,25 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         message = f"Cannot find parquet source: {root_dir}"
         raise SystemExit(message)
 
-    files = discover_parquet_files(root_dir, max_files=args.max_files)
-    if not files:
-        message = f"No parquet files found under {root_dir}"
-        raise SystemExit(message)
-
     root = create_tk_root()
     use_gpu = bool(args.gpu and cudf is not None)
     if args.gpu and not use_gpu:
         print("[pose_viewer_gui] cuDF not available; continuing on CPU", file=sys.stderr)
-    app = PoseViewerApp(root, files, use_gpu=use_gpu)
+    if root_dir.is_file():
+        if root_dir.suffix.lower() != ".parquet":
+            raise SystemExit(f"Specified path is not a parquet file: {root_dir}")
+        initial_files: Optional[Sequence[Path]] = [root_dir]
+        discovery_root = root_dir.parent
+    else:
+        initial_files = None
+        discovery_root = root_dir
+    app = PoseViewerApp(
+        root,
+        initial_files,
+        discovery_root=discovery_root,
+        max_files=args.max_files,
+        use_gpu=use_gpu,
+    )
     try:
         run_mainloop(root)
     finally:

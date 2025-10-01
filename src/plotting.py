@@ -138,6 +138,7 @@ class PoseScene(PoseSceneCameraMixin):
 		self._in_layout_update = False
 		self._unit_scale = 1.0
 		self._unit_label = "pixels"
+		self._cm_per_pixel_hint: Optional[float] = None
 		self._x_axis_label = ""
 		self._y_axis_label = ""
 
@@ -323,34 +324,40 @@ class PoseScene(PoseSceneCameraMixin):
 		print(f"[PoseScene] set_unit_scale requested cm_per_pixel={cm_per_pixel}")
 		current_scale = float(self._unit_scale)
 		current_label = self._unit_label
-		scale_val = None
+		previous_hint = getattr(self, "_cm_per_pixel_hint", None)
+		parsed_hint = None
 		if cm_per_pixel is not None:
 			try:
-				scale_val = float(cm_per_pixel)
+				candidate = float(cm_per_pixel)
 			except (TypeError, ValueError):
-				scale_val = None
-			if scale_val is not None and (not math.isfinite(scale_val) or scale_val <= 0.0):
-				scale_val = None
-		if scale_val is None:
-			new_scale = 1.0
-			new_label = "pixels"
-		else:
-			new_scale = float(scale_val)
-			new_label = "cm"
-		if math.isclose(new_scale, current_scale, rel_tol=1e-9, abs_tol=1e-9) and new_label == current_label:
-			print("[PoseScene] set_unit_scale unchanged; skipping reset")
-			self._unit_scale = current_scale
-			self._unit_label = current_label
+				candidate = None
+			if candidate is not None and math.isfinite(candidate) and candidate > 0.0:
+				parsed_hint = candidate
+		scale_changed = not math.isclose(current_scale, 1.0, rel_tol=1e-9, abs_tol=1e-9) or current_label != "pixels"
+		hint_changed = not (
+			(previous_hint is None and parsed_hint is None)
+			or (
+				previous_hint is not None
+				and parsed_hint is not None
+				and math.isclose(previous_hint, parsed_hint, rel_tol=1e-6, abs_tol=1e-9)
+			)
+		)
+		self._unit_scale = 1.0
+		self._unit_label = "pixels"
+		self._cm_per_pixel_hint = parsed_hint
+		if not scale_changed and not hint_changed:
+			print("[PoseScene] set_unit_scale unchanged; retaining existing geometry")
 			self._update_scale_bar()
 			return
-		self._unit_scale = new_scale
-		self._unit_label = new_label
-		self._base_view_rect = None
-		self._current_view_rect = None
-		self._scene_rect = None
-		self._user_camera_override = False
-		self._override_view_rect = None
-		print(f"[PoseScene] set_unit_scale applied scale={self._unit_scale} label={self._unit_label}; cleared overrides")
+		if scale_changed:
+			self._base_view_rect = None
+			self._current_view_rect = None
+			self._scene_rect = None
+			self._user_camera_override = False
+			self._override_view_rect = None
+			print("[PoseScene] set_unit_scale reset geometry to pixel domain")
+		else:
+			print("[PoseScene] set_unit_scale updated display hint without altering geometry")
 		self._update_scale_bar()
 
 	def _to_scene_units_scalar(self, value: Optional[float]) -> Optional[float]:
@@ -1192,11 +1199,12 @@ class PoseScene(PoseSceneCameraMixin):
 				return f"{value:.2f}"
 			return f"{value:.3f}"
 
-		if self._unit_label == "cm" and self._unit_scale > 0.0:
-			pixel_equiv = scale_units / self._unit_scale
-			label = f"{_format_units(scale_units)} cm  (≈ {pixel_equiv:.0f} px)"
+		cm_hint = getattr(self, "_cm_per_pixel_hint", None)
+		if cm_hint is not None and math.isfinite(cm_hint) and cm_hint > 0.0:
+			centimetres = scale_units * cm_hint
+			label = f"{_format_units(scale_units)} px  (≈ {centimetres:.2f} cm)"
 		else:
-			label = f"{_format_units(scale_units)} {self._unit_label}"
+			label = f"{_format_units(scale_units)} px"
 		self._scale_bar_text.text = label
 		text_x = float(canvas_w) - self._scale_bar_margin
 		text_y = y_base - tick_height - 6.0

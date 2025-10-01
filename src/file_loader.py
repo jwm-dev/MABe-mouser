@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import math
 import threading
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from PyQt6 import QtCore
 import numpy as np
@@ -19,6 +20,9 @@ from .optional_dependencies import cudf, pq
 
 
 class PoseViewerFileMixin(PoseViewerGeometryMixin):
+    _history_store_filename = "pose_viewer_history.json"
+    _history_store_version = 1
+    _history_max_entries = 40
     def _prompt_for_folder(self) -> None:
         directory = self._ask_directory(title="Select directory with parquet files")
         if not directory:
@@ -36,6 +40,8 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
 
     def _go_to_previous_file(self) -> None:
         self._force_pause_playback()
+        if self._navigate_history(-1):
+            return
         if not self.parquet_files:
             return
         self.current_file_index = (self.current_file_index - 1) % len(self.parquet_files)
@@ -43,12 +49,346 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
 
     def _go_to_next_file(self) -> None:
         self._force_pause_playback()
+        if self._navigate_history(1):
+            return
         if not self.parquet_files:
             return
         self.current_file_index = (self.current_file_index + 1) % len(self.parquet_files)
         self._load_current_file()
 
+    def _ensure_history_state(self) -> None:
+        if not isinstance(getattr(self, "_file_history", None), list):
+            self._file_history = []
+        if not isinstance(getattr(self, "_history_position", None), int):
+            self._history_position = -1
+        if not isinstance(getattr(self, "_history_navigation_active", None), bool):
+            self._history_navigation_active = False
+
+    def _history_store_path(self) -> Path:
+        cache_dir = getattr(self, "cache_dir", None)
+        try:
+            base = Path(cache_dir) if cache_dir is not None else Path.cwd()
+        except Exception:
+            base = Path.cwd()
+        return base / self._history_store_filename
+
+    def _load_persisted_history(self) -> None:
+        self._ensure_history_state()
+        store_path = self._history_store_path()
+        try:
+            with store_path.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except FileNotFoundError:
+            return
+        except Exception:
+            return
+        recent = payload.get("recent_files") or payload.get("history")
+        if not isinstance(recent, list):
+            return
+        max_entries = int(getattr(self, "_history_max_entries", 40))
+        cleaned: List[Path] = []
+        for raw in recent[-max_entries:]:
+            if not isinstance(raw, str):
+                continue
+            candidate = Path(raw)
+            if candidate.exists() and candidate.is_file():
+                cleaned.append(candidate)
+        if not cleaned:
+            return
+        self._file_history = list(cleaned)
+        last_index = payload.get("last_index")
+        if isinstance(last_index, int):
+            index = max(0, min(last_index, len(cleaned) - 1))
+        else:
+            index = len(cleaned) - 1
+        self._history_position = index
+        self._history_navigation_active = False
+        target = cleaned[index]
+        setattr(self, "_pending_initial_target", target)
+
+    def _persist_file_history(self) -> None:
+        self._ensure_history_state()
+        try:
+            store_path = self._history_store_path()
+        except Exception:
+            return
+        history: List[Path] = self._file_history  # type: ignore[assignment]
+        max_entries = int(getattr(self, "_history_max_entries", 40))
+        stored = history[-max_entries:]
+        base_index = len(history) - len(stored)
+        entries = [str(path) for path in stored]
+        last_index = -1
+        if stored:
+            relative_index = self._history_position - base_index
+            last_index = max(0, min(relative_index, len(stored) - 1))
+        payload = {
+            "version": self._history_store_version,
+            "recent_files": entries,
+            "last_index": last_index,
+        }
+        try:
+            store_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            with store_path.open("w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+        except Exception:
+            pass
+
+    def _trim_file_history(self) -> None:
+        self._ensure_history_state()
+        history: List[Path] = self._file_history  # type: ignore[assignment]
+        max_entries = int(getattr(self, "_history_max_entries", 40))
+        if len(history) <= max_entries:
+            return
+        excess = len(history) - max_entries
+        if excess <= 0:
+            return
+        del history[:excess]
+        self._history_position = max(0, self._history_position - excess)
+
+    def _set_initial_file_from_path(self, target: Path) -> bool:
+        folder = target.parent
+        if not folder.exists():
+            return False
+        files = sorted(p for p in folder.glob("*.parquet") if p.is_file())
+        if not files:
+            return False
+        try:
+            resolved_target = target.resolve()
+        except FileNotFoundError:
+            return False
+        match_index: Optional[int] = None
+        for idx, candidate in enumerate(files):
+            try:
+                if candidate.resolve() == resolved_target:
+                    match_index = idx
+                    break
+            except FileNotFoundError:
+                continue
+        if match_index is None:
+            return False
+        self.parquet_files = files
+        self.current_file_index = match_index
+        return True
+
+    def _apply_pending_initial_target(self) -> bool:
+        target = getattr(self, "_pending_initial_target", None)
+        if not target:
+            return False
+        if not isinstance(target, Path):
+            try:
+                target = Path(str(target))
+            except Exception:
+                self._pending_initial_target = None
+                return False
+        success = self._set_initial_file_from_path(target)
+        if success:
+            self._pending_initial_target = None
+        return success
+
+    @staticmethod
+    def _coerce_positive_float(value: object) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(num) or num <= 0.0:
+            return None
+        return num
+
+    @staticmethod
+    def _metadata_first_numeric(source: Mapping[str, Any], keys: Iterable[str]) -> Optional[float]:
+        if not isinstance(source, Mapping):
+            return None
+        for key in keys:
+            if key in source:
+                num = PoseViewerFileMixin._coerce_positive_float(source[key])
+                if num is not None:
+                    return num
+        return None
+
+    @classmethod
+    def _metadata_size_px(
+        cls,
+        metadata: Mapping[str, Any],
+        *,
+        width_keys: Sequence[str],
+        height_keys: Sequence[str],
+        section_keys: Sequence[str] = (),
+    ) -> Tuple[Optional[float], Optional[float]]:
+        if not isinstance(metadata, Mapping):
+            return (None, None)
+        width = cls._metadata_first_numeric(metadata, width_keys)
+        height = cls._metadata_first_numeric(metadata, height_keys)
+        for section_key in section_keys:
+            section = metadata.get(section_key)
+            if not isinstance(section, Mapping):
+                continue
+            width = width or cls._metadata_first_numeric(section, ("width_px", "width", "w"))
+            height = height or cls._metadata_first_numeric(section, ("height_px", "height", "h"))
+            if width is not None and height is not None:
+                break
+        return (width, height)
+
+    @classmethod
+    def _metadata_video_size_px(cls, metadata: Mapping[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+        return cls._metadata_size_px(
+            metadata,
+            width_keys=(
+                "video_width_px",
+                "video_width_pix",
+                "video_width_pixels",
+                "frame_width_px",
+            ),
+            height_keys=(
+                "video_height_px",
+                "video_height_pix",
+                "video_height_pixels",
+                "frame_height_px",
+            ),
+            section_keys=("video",),
+        )
+
+    @classmethod
+    def _metadata_arena_size_px(cls, metadata: Mapping[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+        return cls._metadata_size_px(
+            metadata,
+            width_keys=(
+                "arena_width_px",
+                "arena_width_pix",
+                "arena_pixels_width",
+            ),
+            height_keys=(
+                "arena_height_px",
+                "arena_height_pix",
+                "arena_pixels_height",
+            ),
+            section_keys=("arena",),
+        )
+
+    @classmethod
+    def _augment_tracking_metadata(cls, metadata: Dict[str, Any]) -> None:
+        if not isinstance(metadata, dict):
+            return
+        video_w, video_h = cls._metadata_video_size_px(metadata)
+        arena_w, arena_h = cls._metadata_arena_size_px(metadata)
+        if video_w is not None:
+            metadata.setdefault("video_width_px", float(video_w))
+        if video_h is not None:
+            metadata.setdefault("video_height_px", float(video_h))
+        if arena_w is not None:
+            metadata.setdefault("arena_width_px", float(arena_w))
+        if arena_h is not None:
+            metadata.setdefault("arena_height_px", float(arena_h))
+        if video_w is not None and video_h is not None:
+            video_section: Dict[str, Any]
+            video_raw = metadata.get("video")
+            if isinstance(video_raw, Mapping):
+                video_section = dict(video_raw)
+            else:
+                video_section = {}
+            video_section.setdefault("width_px", float(video_w))
+            video_section.setdefault("height_px", float(video_h))
+            video_section.setdefault("width", float(video_w))
+            video_section.setdefault("height", float(video_h))
+            video_section.setdefault("units", "pixels")
+            metadata["video"] = video_section
+        if arena_w is not None and arena_h is not None:
+            arena_section: Dict[str, Any]
+            arena_raw = metadata.get("arena")
+            if isinstance(arena_raw, Mapping):
+                arena_section = dict(arena_raw)
+            else:
+                arena_section = {}
+            arena_section.setdefault("width_px", float(arena_w))
+            arena_section.setdefault("height_px", float(arena_h))
+            arena_section.setdefault("width", float(arena_w))
+            arena_section.setdefault("height", float(arena_h))
+            arena_section.setdefault("units", "pixels")
+            metadata["arena"] = arena_section
+        pixels_per_cm = cls._coerce_positive_float(metadata.get("pixels_per_cm") or metadata.get("pix_per_cm_approx"))
+        cm_per_pixel = cls._coerce_positive_float(metadata.get("cm_per_pixel"))
+        if cm_per_pixel is None and pixels_per_cm:
+            cm_per_pixel = 1.0 / pixels_per_cm
+        if cm_per_pixel and "video" in metadata and isinstance(metadata["video"], dict):
+            metadata["video"].setdefault("cm_per_pixel", float(cm_per_pixel))
+
+    def _navigate_history(self, step: int) -> bool:
+        self._ensure_history_state()
+        history: List[Path] = self._file_history  # type: ignore[assignment]
+        if not history:
+            return False
+        current_index = self._history_position
+        if current_index < 0 or current_index >= len(history):
+            current_index = len(history) - 1
+            target_index = current_index + step
+        else:
+            target_index = current_index + step
+        if target_index < 0 or target_index >= len(history):
+            return False
+        target_path = history[target_index]
+        return self._open_file_from_history(target_path, target_index)
+
+    def _open_file_from_history(self, target: Path, target_index: int) -> bool:
+        self._ensure_history_state()
+        if not self._set_initial_file_from_path(target):
+            return False
+        self._history_navigation_active = True
+        self._history_position = target_index
+        self._load_current_file()
+        return True
+
+    def _record_file_history(self, path: Path) -> None:
+        self._ensure_history_state()
+        try:
+            resolved = path.resolve()
+        except FileNotFoundError:
+            return
+        history: List[Path] = self._file_history  # type: ignore[assignment]
+        if self._history_navigation_active:
+            self._history_navigation_active = False
+            for idx, existing in enumerate(history):
+                try:
+                    if existing.resolve() == resolved:
+                        self._history_position = idx
+                        self._file_history = history
+                        self._trim_file_history()
+                        self._persist_file_history()
+                        return
+                except FileNotFoundError:
+                    continue
+            # if not found, append as new entry
+            history.append(resolved)
+            self._history_position = len(history) - 1
+            self._file_history = history
+            self._trim_file_history()
+            self._persist_file_history()
+            return
+        current_index = self._history_position
+        if 0 <= current_index < len(history) - 1:
+            del history[current_index + 1 :]
+        if history and history[-1] == resolved:
+            self._history_position = len(history) - 1
+            self._file_history = history
+            self._trim_file_history()
+            self._persist_file_history()
+            return
+        history.append(resolved)
+        self._history_position = len(history) - 1
+        self._file_history = history
+        self._trim_file_history()
+        self._persist_file_history()
+
     def _load_current_file(self) -> None:
+        if not self.parquet_files:
+            print("[PoseViewer] _load_current_file skipped (no files available)")
+            return
+        if not (0 <= self.current_file_index < len(self.parquet_files)):
+            self.current_file_index = min(max(self.current_file_index, 0), len(self.parquet_files) - 1)
         self._force_pause_playback()
         path = self.parquet_files[self.current_file_index]
         self._set_file_header_text(path)
@@ -99,13 +439,51 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
             self._invoke_on_main_thread(finalize)
 
             summary_message = self._format_loaded_status(path, data)
-            try:
-                self._queue_progress_update(0.99, f"Caching {path.name}…")
-                self._store_cached_data(path, data)
-            except Exception:
-                self._queue_progress_update(1.0, f"{summary_message} | cache skipped")
-            else:
+            if not getattr(self, "cache_enabled", True):
                 self._queue_progress_update(1.0, summary_message)
+                return
+
+            cache_message = summary_message
+
+            def _toggle_camera_interaction(enabled: bool) -> None:
+                scene = getattr(self, "scene", None)
+                setter = getattr(scene, "set_camera_interaction_enabled", None) if scene is not None else None
+                if callable(setter):
+                    setter(enabled, reason="caching")
+
+            self._queue_progress_update(0.99, f"Caching {path.name}…")
+            self._invoke_on_main_thread(lambda: _toggle_camera_interaction(False))
+            start_time = time.perf_counter()
+            cache_stored = False
+            try:
+                self._store_cached_data(path, data)
+                cache_stored = True
+            except Exception:
+                cache_message = f"{summary_message} | cache skipped"
+            finally:
+                duration = time.perf_counter() - start_time
+                if cache_stored:
+                    print(f"[PoseViewer] cached {path.name} in {duration:.3f}s")
+                self._invoke_on_main_thread(lambda: _toggle_camera_interaction(True))
+
+            self._queue_progress_update(1.0, cache_message)
+
+        def _schedule_initial_load(self) -> None:
+            if not getattr(self, "parquet_files", None):
+                print("[PoseViewer] _schedule_initial_load postponed (no files yet)")
+                return
+            if getattr(self, "_initial_load_scheduled", False):
+                return
+            self._initial_load_scheduled = True
+            def _run_initial_load() -> None:
+                apply_target = getattr(self, "_apply_pending_initial_target", None)
+                applied = bool(callable(apply_target) and apply_target())
+                if applied:
+                    update_menu = getattr(self, "_update_file_menu", None)
+                    if callable(update_menu):
+                        update_menu()
+                self._load_current_file()
+            QtCore.QTimer.singleShot(0, _run_initial_load)
 
         if self.loading_thread and self.loading_thread.is_alive():
             self.loading_thread.join(timeout=0.1)
@@ -134,6 +512,7 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
         else:
             self._set_behavior("No behavior annotations found for this file")
         self._render_frame(0)
+        self._record_file_history(path)
         scene = getattr(self, "scene", None)
         if scene is not None and hasattr(scene, "show_scale_bar_hint"):
             scene.show_scale_bar_hint()
@@ -632,10 +1011,8 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
         def _valid(value: object) -> bool:
             return isinstance(value, (int, float)) and math.isfinite(float(value)) and float(value) > 0.0
 
-        arena_width_px = metadata.get("arena_width_px") if metadata else None
-        arena_height_px = metadata.get("arena_height_px") if metadata else None
-        video_width_px = metadata.get("video_width_px") if metadata else None
-        video_height_px = metadata.get("video_height_px") if metadata else None
+        arena_width_px, arena_height_px = self._metadata_arena_size_px(metadata)
+        video_width_px, video_height_px = self._metadata_video_size_px(metadata)
 
         if metadata:
             pixels_per_cm = metadata.get("pixels_per_cm") or metadata.get("pix_per_cm_approx")
@@ -839,6 +1216,7 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
             )
 
         if metadata:
+            self._augment_tracking_metadata(metadata)
             metadata.setdefault("display_aspect_ratio", target_ratio)
             metadata.setdefault("display_center_x", center_x)
             metadata.setdefault("display_center_y", center_y)

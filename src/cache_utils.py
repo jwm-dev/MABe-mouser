@@ -14,6 +14,7 @@ from .constants import CACHE_VERSION
 
 class PoseViewerCacheMixin:
     _cache_filename = "pose_cache.pkl.gz"
+    _max_cached_entries = 5
 
     def _get_cache_lock(self) -> threading.RLock:
         lock = getattr(self, "_cache_lock", None)
@@ -40,7 +41,31 @@ class PoseViewerCacheMixin:
         if entries is None:
             self._migrate_legacy_cache_files()
             entries = self._cache_entries = self._load_cache_entries()
+            if self._prune_cache_entries(entries):
+                self._flush_cache_entries(entries)
         return entries
+
+    def _flush_cache_on_startup(self) -> None:
+        if not getattr(self, "cache_enabled", True):
+            return
+        with self._get_cache_lock():
+            entries = self._ensure_cache_entries()
+            self._flush_cache_entries(entries)
+
+    def _prune_cache_entries(self, entries: Dict[str, Dict[str, Any]]) -> bool:
+        limit = int(getattr(self, "_max_cached_entries", 5))
+        if limit <= 0:
+            entries.clear()
+            return True
+        modified = False
+        while len(entries) > limit:
+            try:
+                oldest_key = next(iter(entries))
+            except StopIteration:
+                break
+            entries.pop(oldest_key, None)
+            modified = True
+        return modified
 
     def _load_cache_entries(self) -> Dict[str, Dict[str, Any]]:
         cache_file = self._cache_file()
@@ -128,16 +153,34 @@ class PoseViewerCacheMixin:
         with self._get_cache_lock():
             entries = self._ensure_cache_entries()
             resolved = str(path.resolve())
+            signature = self._cache_signature(path)
             stale_keys = [key for key, entry in entries.items() if isinstance(entry, dict) and entry.get("path") == resolved]
+            state_changed = False
             for stale in stale_keys:
-                entries.pop(stale, None)
+                if entries.pop(stale, None) is not None:
+                    state_changed = True
             cache_key = self._cache_key(path)
+            existing = entries.get(cache_key)
+            if (
+                isinstance(existing, dict)
+                and existing.get("signature") == signature
+                and existing.get("path") == resolved
+            ):
+                if self._prune_cache_entries(entries):
+                    state_changed = True
+                if state_changed:
+                    self._flush_cache_entries(entries)
+                return
             entries[cache_key] = {
                 "path": resolved,
-                "signature": self._cache_signature(path),
+                "signature": signature,
                 "payload": data,
             }
-            self._flush_cache_entries(entries)
+            state_changed = True
+            if self._prune_cache_entries(entries):
+                state_changed = True
+            if state_changed:
+                self._flush_cache_entries(entries)
 
     @staticmethod
     def _safe_unlink(path: Path) -> None:

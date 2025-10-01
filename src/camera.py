@@ -25,6 +25,7 @@ class PoseSceneCameraMixin:
 		self._override_view_rect: Optional[SceneRect] = None
 		self._pending_user_camera_override = False
 		self._camera_change_callback: Optional[Callable[[SceneRect, bool, str], None]] = None
+		self._camera_input_enabled = True
 
 		camera = scene.cameras.PanZoomCamera(aspect=1.0, rect=(0.0, 0.0, 1.0, 1.0))
 		camera.interactive = True
@@ -53,6 +54,26 @@ class PoseSceneCameraMixin:
 		value = bool(self._user_camera_override)
 		print(f"[PoseScene] has_user_camera_override -> {value}")
 		return value
+
+	def is_camera_interaction_enabled(self) -> bool:
+		state = bool(getattr(self, "_camera_input_enabled", True))
+		print(f"[PoseScene] is_camera_interaction_enabled -> {state}")
+		return state
+
+	def set_camera_interaction_enabled(self, enabled: bool, *, reason: str = "unspecified") -> None:
+		enabled_flag = bool(enabled)
+		current = bool(getattr(self, "_camera_input_enabled", True))
+		if current == enabled_flag:
+			return
+		setattr(self, "_camera_input_enabled", enabled_flag)
+		camera = getattr(self.view, "camera", None)
+		if camera is not None:
+			try:
+				camera.interactive = enabled_flag
+			except Exception:
+				pass
+		state = "enabled" if enabled_flag else "disabled"
+		print(f"[PoseScene] set_camera_interaction_enabled -> {state} reason={reason}")
 
 	def on_camera_change(self, callback: Optional[Callable[[SceneRect, bool, str], None]]) -> None:
 		self._camera_change_callback = callback
@@ -161,6 +182,9 @@ class PoseSceneCameraMixin:
 		print(f"[PoseScene] _on_canvas_mouse_wheel delta={delta}")
 
 	def _forward_event_to_camera(self, event: Any) -> bool:
+		if not getattr(self, "_camera_input_enabled", True):
+			print("[PoseScene] _forward_event_to_camera ignored (camera input disabled)")
+			return False
 		camera = getattr(self.view, "camera", None)
 		if camera is None:
 			return False
@@ -179,6 +203,9 @@ class PoseSceneCameraMixin:
 		delta = getattr(event, "delta", None)
 		info = self._describe_mouse_event(event)
 		print(f"[PoseScene] _on_view_mouse_wheel delta={delta} {info}")
+		if not getattr(self, "_camera_input_enabled", True):
+			print("[PoseScene] _on_view_mouse_wheel ignored (camera input disabled)")
+			return
 		forwarded = self._forward_event_to_camera(event)
 		if forwarded:
 			updated = self._describe_mouse_event(event)
@@ -188,6 +215,9 @@ class PoseSceneCameraMixin:
 		info = self._describe_mouse_event(event)
 		print(f"[PoseScene] _on_view_mouse_event {info}")
 		if self._handle_scale_bar_mouse_event(event):
+			return
+		if not getattr(self, "_camera_input_enabled", True):
+			print("[PoseScene] _on_view_mouse_event ignored (camera input disabled)")
 			return
 		forwarded = self._forward_event_to_camera(event)
 		if forwarded:
@@ -220,6 +250,9 @@ class PoseSceneCameraMixin:
 		else:
 			event_name = "None"
 		print(f"[PoseScene] _on_camera_interaction event={event_name}")
+		if not getattr(self, "_camera_input_enabled", True):
+			print("[PoseScene] _on_camera_interaction ignored (camera input disabled)")
+			return
 		self._on_camera_transform_change(event)
 
 	def _on_camera_transform_change(self, event: Optional[Any] = None) -> None:

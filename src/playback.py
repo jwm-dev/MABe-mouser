@@ -470,17 +470,15 @@ class PoseViewerPlaybackMixin(PoseViewerGeometryMixin):
         aspect_value = self.current_data.get("display_aspect_ratio") if isinstance(self.current_data, dict) else None
         metadata_obj = self.current_data.get("metadata") if isinstance(self.current_data, dict) else None
         metadata = metadata_obj if isinstance(metadata_obj, dict) else {}
-        video_size: Optional[Tuple[float, float]] = None
-        arena_size: Optional[Tuple[float, float]] = None
-        if metadata:
-            vw = metadata.get("video_width_px")
-            vh = metadata.get("video_height_px")
-            if isinstance(vw, (int, float)) and isinstance(vh, (int, float)) and math.isfinite(float(vw)) and math.isfinite(float(vh)) and float(vw) > 0.0 and float(vh) > 0.0:
-                video_size = (float(vw), float(vh))
-            aw = metadata.get("arena_width_px")
-            ah = metadata.get("arena_height_px")
-            if isinstance(aw, (int, float)) and isinstance(ah, (int, float)) and math.isfinite(float(aw)) and math.isfinite(float(ah)) and float(aw) > 0.0 and float(ah) > 0.0:
-                arena_size = (float(aw), float(ah))
+        metadata_mapping: Mapping[str, Any] = metadata if isinstance(metadata, Mapping) else {}
+        video_size = None
+        arena_size = None
+        video_dims = self._metadata_video_size_px(metadata_mapping) if metadata_mapping else (None, None)
+        arena_dims = self._metadata_arena_size_px(metadata_mapping) if metadata_mapping else (None, None)
+        if all(value is not None for value in video_dims):
+            video_size = (float(video_dims[0]), float(video_dims[1]))  # type: ignore[index]
+        if all(value is not None for value in arena_dims):
+            arena_size = (float(arena_dims[0]), float(arena_dims[1]))  # type: ignore[index]
         raw_domain_xlim = self.current_data.get("domain_xlim") if isinstance(self.current_data, dict) else None
         raw_domain_ylim = self.current_data.get("domain_ylim") if isinstance(self.current_data, dict) else None
         if isinstance(raw_domain_xlim, (tuple, list)) and len(raw_domain_xlim) >= 2:
@@ -500,10 +498,9 @@ class PoseViewerPlaybackMixin(PoseViewerGeometryMixin):
                 if width_val > 0.0 and height_val > 0.0:
                     arena_size = (width_val, height_val)
 
-        metadata_mapping: Mapping[str, Any] = metadata if isinstance(metadata, Mapping) else {}
         cm_per_pixel = self._resolve_cm_per_pixel(metadata_mapping, domain_xlim, domain_ylim)
         self._cm_per_pixel = cm_per_pixel
-        self._unit_label = "cm" if cm_per_pixel else "pixels"
+        self._unit_label = "pixels"
         self.scene.set_unit_scale(cm_per_pixel=cm_per_pixel)
         self.scene.set_scene_dimensions(video_size=video_size, arena_size=arena_size)
         if isinstance(aspect_value, (int, float)) and math.isfinite(float(aspect_value)) and float(aspect_value) > 0.0:
@@ -550,8 +547,20 @@ class PoseViewerPlaybackMixin(PoseViewerGeometryMixin):
             self._restore_preserved_camera()
         else:
             print("[Playback] _render_pose_state no override to restore")
-        label_suffix = "cm" if cm_per_pixel else "pixels"
-        self._update_canvas_labels(xlabel=f"X ({label_suffix})", ylabel=f"Y ({label_suffix})", title=frame_title)
+        width_hint = None
+        height_hint = None
+        if video_size and len(video_size) >= 2:
+            if math.isfinite(float(video_size[0])):
+                width_hint = int(round(float(video_size[0])))
+            if math.isfinite(float(video_size[1])):
+                height_hint = int(round(float(video_size[1])))
+        x_label_suffix = f"pixels, video width {width_hint}px" if width_hint is not None else "pixels"
+        y_label_suffix = f"pixels, video height {height_hint}px" if height_hint is not None else "pixels"
+        self._update_canvas_labels(
+            xlabel=f"X ({x_label_suffix})",
+            ylabel=f"Y ({y_label_suffix})",
+            title=frame_title,
+        )
 
         self._ensure_mouse_colors(mouse_groups.keys())
 
