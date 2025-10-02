@@ -62,6 +62,8 @@ LABEL_TEXT_LINE_HEIGHT = 1.32
 LABEL_TEXT_WIDTH_FACTOR = 0.62
 LABEL_TEXT_EXTRA_CHARS = 1.4
 LABEL_MOUSE_PADDING = 18.0
+VIDEO_LABEL_OFFSET = 12.0
+ARENA_LABEL_OFFSET = 12.0
 class PoseScene(PoseSceneCameraMixin):
 	def __init__(
 		self,
@@ -132,6 +134,11 @@ class PoseScene(PoseSceneCameraMixin):
 		self._arena_rect: Optional[SceneRect] = None
 		self._arena_size: Optional[Tuple[float, float]] = None
 		self._video_size: Optional[Tuple[float, float]] = None
+		self._video_rect: Optional[SceneRect] = None
+		self._scene_rects_dirty = False
+		self._overlay_center: Optional[Tuple[float, float]] = None
+		self._data_translation: Tuple[float, float] = (0.0, 0.0)
+		self._arena_size_cm: Optional[Tuple[float, float]] = None
 		self._hover_callback: Optional[Callable[[Optional[Dict[str, Any]]], None]] = None
 		self._hover_datasets: List[HoverDataset] = []
 		self._hover_threshold_px = 16.0
@@ -162,6 +169,38 @@ class PoseScene(PoseSceneCameraMixin):
 			anchor_y="bottom",
 		)
 		self._hover_text.visible = False
+
+		self._video_border_color = np.asarray(_rgba(UI_TEXT_PRIMARY, 0.45), dtype=np.float32)
+		self._arena_border_color = np.asarray(_rgba(UI_ACCENT, 0.62), dtype=np.float32)
+		self._video_border = visuals.Line(parent=self.view.scene, connect="segments")
+		self._video_border.set_gl_state("translucent", depth_test=False)
+		self._video_border.visible = False
+
+		self._arena_border = visuals.Line(parent=self.view.scene, connect="segments")
+		self._arena_border.set_gl_state("translucent", depth_test=False)
+		self._arena_border.visible = False
+
+		self._video_label_base_color = np.asarray(_rgba(UI_TEXT_PRIMARY, 0.88), dtype=np.float32)
+		self._arena_label_base_color = np.asarray(_rgba(UI_ACCENT, 0.92), dtype=np.float32)
+		self._video_label = visuals.Text(
+			"",
+			color=tuple(self._video_label_base_color),
+			font_size=11,
+			parent=self.view.scene,
+			anchor_x="center",
+			anchor_y="bottom",
+		)
+		self._video_label.visible = False
+		self._arena_label = visuals.Text(
+			"",
+			color=tuple(self._arena_label_base_color),
+			font_size=11,
+			parent=self.view.scene,
+			anchor_x="center",
+			anchor_y="top",
+		)
+		self._arena_label.visible = False
+		self._label_fade_thresholds = (0.45, 0.9)
 
 		initialise_lighting_visuals(self)
 
@@ -355,6 +394,7 @@ class PoseScene(PoseSceneCameraMixin):
 			self._scene_rect = None
 			self._user_camera_override = False
 			self._override_view_rect = None
+			self._scene_rects_dirty = True
 			print("[PoseScene] set_unit_scale reset geometry to pixel domain")
 		else:
 			print("[PoseScene] set_unit_scale updated display hint without altering geometry")
@@ -368,13 +408,23 @@ class PoseScene(PoseSceneCameraMixin):
 	def _to_scene_units_array(self, array: np.ndarray) -> np.ndarray:
 		if array.size == 0:
 			return array.astype(np.float32, copy=False)
-		if math.isclose(self._unit_scale, 1.0, rel_tol=1e-9, abs_tol=1e-9):
-			return array.astype(np.float32, copy=False)
-		scaled = array.astype(np.float32, copy=True)
-		if scaled.ndim >= 1 and scaled.shape[-1] >= 1:
-			scaled[..., 0] *= self._unit_scale
-		if scaled.ndim >= 1 and scaled.shape[-1] >= 2:
-			scaled[..., 1] *= self._unit_scale
+		scaled = array.astype(np.float32, copy=False)
+		scale_needed = not math.isclose(self._unit_scale, 1.0, rel_tol=1e-9, abs_tol=1e-9)
+		offset_x, offset_y = self._data_translation
+		translate_needed = not (
+			math.isclose(offset_x, 0.0, abs_tol=1e-9)
+			and math.isclose(offset_y, 0.0, abs_tol=1e-9)
+		)
+		if scale_needed or (translate_needed and scaled.ndim >= 1 and scaled.shape[-1] >= 2):
+			scaled = scaled.copy()
+		if scale_needed:
+			if scaled.ndim >= 1 and scaled.shape[-1] >= 1:
+				scaled[..., 0] *= self._unit_scale
+			if scaled.ndim >= 1 and scaled.shape[-1] >= 2:
+				scaled[..., 1] *= self._unit_scale
+		if translate_needed and scaled.ndim >= 1 and scaled.shape[-1] >= 2:
+			scaled[..., 0] += float(offset_x)
+			scaled[..., 1] += float(offset_y)
 		return scaled
 
 	def on_hover(self, callback: Callable[[Optional[Dict[str, Any]]], None]) -> None:
@@ -448,6 +498,7 @@ class PoseScene(PoseSceneCameraMixin):
 				self._manual_aspect_ratio = None
 		else:
 			self._manual_aspect_ratio = None
+		self._scene_rects_dirty = True
 		domain_width, domain_height = self._compute_domain_dimensions()
 		self._target_aspect_ratio = self._resolve_aspect_ratio(domain_width=domain_width, domain_height=domain_height, data_rect=self._data_rect)
 		self._apply_geometry()
@@ -468,45 +519,85 @@ class PoseScene(PoseSceneCameraMixin):
 		*,
 		video_size: Optional[Tuple[float, float]] = None,
 		arena_size: Optional[Tuple[float, float]] = None,
+		arena_size_cm: Optional[Tuple[float, float]] = None,
 	) -> None:
-		changed = False
-		if video_size and len(video_size) >= 2:
-			vw = float(video_size[0])
-			vh = float(video_size[1])
-			if math.isfinite(vw) and math.isfinite(vh) and vw > 0.0 and vh > 0.0:
-				converted_w = self._to_scene_units_scalar(vw)
-				converted_h = self._to_scene_units_scalar(vh)
-				if converted_w is None or converted_h is None:
-					converted_w = float(vw)
-					converted_h = float(vh)
-				tuple_value = (float(converted_w), float(converted_h))
-				if self._video_size != tuple_value:
-					self._video_size = tuple_value
-					changed = True
-		if arena_size and len(arena_size) >= 2:
-			aw = float(arena_size[0])
-			ah = float(arena_size[1])
-			if math.isfinite(aw) and math.isfinite(ah) and aw > 0.0 and ah > 0.0:
-				converted_w = self._to_scene_units_scalar(aw)
-				converted_h = self._to_scene_units_scalar(ah)
-				if converted_w is None or converted_h is None:
-					converted_w = float(aw)
-					converted_h = float(ah)
-				tuple_value = (float(converted_w), float(converted_h))
-				if self._arena_size != tuple_value:
-					self._arena_size = tuple_value
-					self._arena_rect = None
-					changed = True
-		elif arena_size is None and self._arena_rect is not None:
-			self._arena_rect = None
+		geometry_changed = False
+		overlay_dirty = False
+
+		def _normalise_scene_pair(raw: Optional[Tuple[float, float]]) -> Optional[Tuple[float, float]]:
+			if raw is None or len(raw) < 2:
+				return None
+			try:
+				tuple_val = (float(raw[0]), float(raw[1]))
+			except (TypeError, ValueError):
+				return None
+			if not (
+				math.isfinite(tuple_val[0])
+				and math.isfinite(tuple_val[1])
+				and tuple_val[0] > 0.0
+				and tuple_val[1] > 0.0
+			):
+				return None
+			converted_w = self._to_scene_units_scalar(tuple_val[0])
+			converted_h = self._to_scene_units_scalar(tuple_val[1])
+			if converted_w is None or converted_h is None:
+				return (tuple_val[0], tuple_val[1])
+			return (float(converted_w), float(converted_h))
+
+		video_pair = _normalise_scene_pair(video_size)
+		if video_pair is not None:
+			if self._video_size != video_pair:
+				self._video_size = video_pair
+				geometry_changed = True
+				overlay_dirty = True
+				self._scene_rects_dirty = True
+			elif self._video_rect is None:
+				self._scene_rects_dirty = True
+		elif video_size is None and (self._video_size is not None or self._video_rect is not None):
+			self._video_size = None
+			self._video_rect = None
+			geometry_changed = True
+			overlay_dirty = True
+			self._scene_rects_dirty = True
+
+		arena_pair = _normalise_scene_pair(arena_size)
+		if arena_pair is not None:
+			if self._arena_size != arena_pair:
+				self._arena_size = arena_pair
+				geometry_changed = True
+				overlay_dirty = True
+				self._scene_rects_dirty = True
+			elif self._arena_rect is None:
+				self._scene_rects_dirty = True
+		elif arena_size is None and (self._arena_size is not None or self._arena_rect is not None):
 			self._arena_size = None
-			changed = True
-		if changed:
-			print(f"[PoseScene] set_scene_dimensions video={self._video_size} arena={self._arena_size}")
+			self._arena_rect = None
+			geometry_changed = True
+			overlay_dirty = True
+			self._scene_rects_dirty = True
+
+		arena_cm_pair = self._size_to_pair(arena_size_cm)
+		if arena_cm_pair is not None:
+			new_cm = (float(arena_cm_pair[0]), float(arena_cm_pair[1]))
+			if self._arena_size_cm != new_cm:
+				self._arena_size_cm = new_cm
+				overlay_dirty = True
+		elif arena_size_cm is None and self._arena_size_cm is not None:
+			self._arena_size_cm = None
+			overlay_dirty = True
+
+		rects_changed = self._ensure_scene_rects()
+
+		if geometry_changed or rects_changed:
+			print(
+				f"[PoseScene] set_scene_dimensions video={self._video_size} arena={self._arena_size} arena_cm={self._arena_size_cm} center={self._overlay_center}"
+			)
 			self._user_camera_override = False
 			self._override_view_rect = None
 			self._apply_geometry()
 			self._update_layout_for_dimensions()
+		if geometry_changed or overlay_dirty or rects_changed:
+			self._update_area_overlays()
 
 	@staticmethod
 	def _size_to_pair(value: Any) -> Optional[Tuple[float, float]]:
@@ -560,6 +651,96 @@ class PoseScene(PoseSceneCameraMixin):
 				if height_val is not None and math.isfinite(height_val) and height_val > 0.0:
 					domain_height = height_val
 		return (domain_width, domain_height)
+
+	@staticmethod
+	def _rect_equal(lhs: Optional[SceneRect], rhs: Optional[SceneRect], *, tol: float = 1e-6) -> bool:
+		if lhs is None or rhs is None:
+			return lhs is None and rhs is None
+		return (
+			abs(lhs.x - rhs.x) <= tol
+			and abs(lhs.y - rhs.y) <= tol
+			and abs(lhs.width - rhs.width) <= tol
+			and abs(lhs.height - rhs.height) <= tol
+		)
+
+	def _ensure_scene_rects(self) -> bool:
+		if not getattr(self, "_scene_rects_dirty", False):
+			return False
+		prev_video = self._video_rect
+		prev_arena = self._arena_rect
+		prev_translation = getattr(self, "_data_translation", (0.0, 0.0))
+		base_x_min = 0.0
+		base_y_min = 0.0
+		if self._domain_xlim is not None and self._domain_xlim[0] is not None:
+			base_x_min = float(self._domain_xlim[0])
+		elif self._data_rect is not None:
+			base_x_min = float(self._data_rect.x)
+		if self._domain_ylim is not None and self._domain_ylim[0] is not None:
+			base_y_min = float(self._domain_ylim[0])
+		elif self._data_rect is not None:
+			base_y_min = float(self._data_rect.y)
+
+		center_x: Optional[float] = None
+		center_y: Optional[float] = None
+		if self._video_size is not None:
+			center_x = base_x_min + float(self._video_size[0]) * 0.5
+			center_y = base_y_min + float(self._video_size[1]) * 0.5
+		elif self._arena_size is not None:
+			center_x = base_x_min + float(self._arena_size[0]) * 0.5
+			center_y = base_y_min + float(self._arena_size[1]) * 0.5
+
+		if center_x is None:
+			if self._data_rect is not None:
+				center_x = float(self._data_rect.center[0])
+			elif self._domain_xlim is not None and self._domain_xlim[0] is not None and self._domain_xlim[1] is not None:
+				center_x = (float(self._domain_xlim[0]) + float(self._domain_xlim[1])) * 0.5
+			else:
+				center_x = base_x_min
+		if center_y is None:
+			if self._data_rect is not None:
+				center_y = float(self._data_rect.center[1])
+			elif self._domain_ylim is not None and self._domain_ylim[0] is not None and self._domain_ylim[1] is not None:
+				center_y = (float(self._domain_ylim[0]) + float(self._domain_ylim[1])) * 0.5
+			else:
+				center_y = base_y_min
+
+		self._overlay_center = (center_x, center_y)
+
+		if self._video_size is not None:
+			video_w, video_h = self._video_size
+			self._video_rect = SceneRect(center_x - video_w * 0.5, center_y - video_h * 0.5, video_w, video_h)
+		else:
+			self._video_rect = None
+		if self._arena_size is not None:
+			arena_w, arena_h = self._arena_size
+			self._arena_rect = SceneRect(center_x - arena_w * 0.5, center_y - arena_h * 0.5, arena_w, arena_h)
+		else:
+			self._arena_rect = None
+
+		self._scene_rects_dirty = False
+
+		if self._video_rect is not None:
+			offset_x = float(self._video_rect.x)
+			offset_y = float(self._video_rect.y)
+		elif self._arena_rect is not None:
+			offset_x = float(self._arena_rect.x)
+			offset_y = float(self._arena_rect.y)
+		else:
+			offset_x = float(base_x_min)
+			offset_y = float(base_y_min)
+		new_translation = (offset_x, offset_y)
+		translation_changed = not (
+			math.isclose(prev_translation[0], new_translation[0], rel_tol=1e-6, abs_tol=1e-9)
+			and math.isclose(prev_translation[1], new_translation[1], rel_tol=1e-6, abs_tol=1e-9)
+		)
+		self._data_translation = new_translation
+
+		changed = (
+			not self._rect_equal(prev_video, self._video_rect)
+			or not self._rect_equal(prev_arena, self._arena_rect)
+			or translation_changed
+		)
+		return changed
 
 	def _resolve_aspect_ratio(
 		self,
@@ -632,12 +813,14 @@ class PoseScene(PoseSceneCameraMixin):
 			f" data_rect={self._data_rect} base_view={self._base_view_rect} override={self._override_view_rect}"
 		)
 		data_rect = self._data_rect
+		rects_changed = self._ensure_scene_rects()
+		arena_rect = self._arena_rect
+		video_rect = self._video_rect
 
 		dom_x_min = self._domain_xlim[0] if self._domain_xlim else None
 		dom_x_max = self._domain_xlim[1] if self._domain_xlim else None
 		dom_y_min = self._domain_ylim[0] if self._domain_ylim else None
 		dom_y_max = self._domain_ylim[1] if self._domain_ylim else None
-		arena_size = self._arena_size if self._arena_size is not None else None
 		domain_rect: Optional[SceneRect] = None
 		if (
 			dom_x_min is not None
@@ -649,38 +832,64 @@ class PoseScene(PoseSceneCameraMixin):
 				(float(dom_x_min), float(dom_x_max)),
 				(float(dom_y_min), float(dom_y_max)),
 			)
-		arena_rect_source = "none"
-		arena_rect_candidate: Optional[SceneRect] = None
-		if domain_rect is not None:
-			arena_rect_candidate = domain_rect
-			arena_rect_source = "domain"
-		elif arena_size is not None:
-			arena_w, arena_h = arena_size
-			if dom_x_min is not None and dom_y_min is not None:
-				arena_rect_candidate = SceneRect(float(dom_x_min), float(dom_y_min), arena_w, arena_h)
-			elif data_rect is not None:
-				center_x_data, center_y_data = data_rect.center
-				arena_rect_candidate = SceneRect(
-					center_x_data - arena_w * 0.5,
-					center_y_data - arena_h * 0.5,
-					arena_w,
-					arena_h,
-				)
-			else:
-				arena_rect_candidate = SceneRect(0.0, 0.0, arena_w, arena_h)
-			arena_rect_source = "metadata"
-		elif data_rect is not None:
-			arena_rect_candidate = data_rect
-			arena_rect_source = "data"
-		if arena_rect_candidate is not None:
-			if dom_x_min is None:
-				dom_x_min = arena_rect_candidate.x
-			if dom_x_max is None:
-				dom_x_max = arena_rect_candidate.x + arena_rect_candidate.width
-			if dom_y_min is None:
-				dom_y_min = arena_rect_candidate.y
-			if dom_y_max is None:
-				dom_y_max = arena_rect_candidate.y + arena_rect_candidate.height
+
+		if data_rect is not None:
+			min_x = float(data_rect.x)
+			max_x = float(data_rect.x + data_rect.width)
+			min_y = float(data_rect.y)
+			max_y = float(data_rect.y + data_rect.height)
+		elif video_rect is not None:
+			min_x = float(video_rect.x)
+			max_x = float(video_rect.x + video_rect.width)
+			min_y = float(video_rect.y)
+			max_y = float(video_rect.y + video_rect.height)
+		elif arena_rect is not None:
+			min_x = float(arena_rect.x)
+			max_x = float(arena_rect.x + arena_rect.width)
+			min_y = float(arena_rect.y)
+			max_y = float(arena_rect.y + arena_rect.height)
+		elif domain_rect is not None:
+			min_x = float(domain_rect.x)
+			max_x = float(domain_rect.x + domain_rect.width)
+			min_y = float(domain_rect.y)
+			max_y = float(domain_rect.y + domain_rect.height)
+		else:
+			min_x = 0.0
+			max_x = 1.0
+			min_y = 0.0
+			max_y = 1.0
+
+		def _expand_with_rect(rect: Optional[SceneRect]) -> None:
+			if rect is None or rect.width <= 0.0 or rect.height <= 0.0:
+				return
+			nonlocal min_x, min_y, max_x, max_y
+			min_x = min(min_x, float(rect.x))
+			min_y = min(min_y, float(rect.y))
+			max_x = max(max_x, float(rect.x + rect.width))
+			max_y = max(max_y, float(rect.y + rect.height))
+
+		_expand_with_rect(domain_rect)
+		_expand_with_rect(video_rect)
+		_expand_with_rect(arena_rect)
+		_expand_with_rect(data_rect)
+
+		if dom_x_min is not None:
+			min_x = min(min_x, float(dom_x_min))
+		if dom_x_max is not None:
+			max_x = max(max_x, float(dom_x_max))
+		elif video_rect is not None:
+			max_x = max(max_x, float(video_rect.x + video_rect.width))
+		if dom_y_min is not None:
+			min_y = min(min_y, float(dom_y_min))
+		if dom_y_max is not None:
+			max_y = max(max_y, float(dom_y_max))
+		elif video_rect is not None:
+			max_y = max(max_y, float(video_rect.y + video_rect.height))
+
+		min_x = float(min_x)
+		max_x = float(max_x)
+		min_y = float(min_y)
+		max_y = float(max_y)
 
 		domain_width: Optional[float] = None
 		domain_height: Optional[float] = None
@@ -693,80 +902,23 @@ class PoseScene(PoseSceneCameraMixin):
 			domain_width=domain_width,
 			domain_height=domain_height,
 			data_rect=data_rect,
-			arena_rect=arena_rect_candidate,
+			arena_rect=arena_rect,
 		)
 		self._target_aspect_ratio = float(max(target_ratio, 1e-6))
+		if self._target_aspect_ratio <= 0.0 or not math.isfinite(self._target_aspect_ratio):
+			self._target_aspect_ratio = 1.0
+
+		width = max(float(max_x - min_x), 1e-6)
+		height = max(float(max_y - min_y), 1e-6)
+		center_x = (min_x + max_x) * 0.5
+		center_y = (min_y + max_y) * 0.5
+
+		ratio = width / max(height, 1e-9)
 		target_ratio = self._target_aspect_ratio
-
-		if data_rect is None:
-			if not self._in_layout_update:
-				self._update_layout_for_dimensions()
-			return
-
-		data_width = max(data_rect.width, 1e-6)
-		data_height = max(data_rect.height, 1e-6)
-		arena_width = arena_rect_candidate.width if arena_rect_candidate is not None else None
-		arena_height = arena_rect_candidate.height if arena_rect_candidate is not None else None
-
-		min_width = data_width
-		min_height = data_height
-		if domain_width and domain_width > 0.0:
-			min_width = max(min_width, domain_width)
-		if domain_height and domain_height > 0.0:
-			min_height = max(min_height, domain_height)
-		if arena_width and arena_width > 0.0:
-			min_width = max(min_width, arena_width)
-		if arena_height and arena_height > 0.0:
-			min_height = max(min_height, arena_height)
-
-		width = max(min_width, min_height * target_ratio)
-		height = width / target_ratio if target_ratio > 0.0 else min_height
-		if height < min_height:
-			height = min_height
-			width = height * (target_ratio if target_ratio > 0.0 else 1.0)
-
-		width = max(width, 1e-6)
-		height = max(height, 1e-6)
-
-		if arena_rect_candidate is not None:
-			center_x, center_y = arena_rect_candidate.center
-		else:
-			center_x, center_y = data_rect.center
-		if dom_x_min is not None and dom_x_max is not None:
-			halve_w = width * 0.5
-			min_cx = float(dom_x_min) + halve_w
-			max_cx = float(dom_x_max) - halve_w
-			if max_cx >= min_cx:
-				center_x = min(max(center_x, min_cx), max_cx)
-			else:
-				center_x = (float(dom_x_min) + float(dom_x_max)) * 0.5
-		if dom_y_min is not None and dom_y_max is not None:
-			halve_h = height * 0.5
-			min_cy = float(dom_y_min) + halve_h
-			max_cy = float(dom_y_max) - halve_h
-			if max_cy >= min_cy:
-				center_y = min(max(center_y, min_cy), max_cy)
-			else:
-				center_y = (float(dom_y_min) + float(dom_y_max)) * 0.5
-		if arena_rect_source == "domain" and arena_rect_candidate is not None:
-			self._arena_rect = arena_rect_candidate
-		elif arena_rect_source == "metadata" and arena_size is not None:
-			arena_w, arena_h = arena_size
-			self._arena_rect = SceneRect(
-				center_x - arena_w * 0.5,
-				center_y - arena_h * 0.5,
-				arena_w,
-				arena_h,
-			)
-		elif arena_rect_source == "data" and arena_rect_candidate is not None:
-			self._arena_rect = SceneRect(
-				center_x - arena_rect_candidate.width * 0.5,
-				center_y - arena_rect_candidate.height * 0.5,
-				arena_rect_candidate.width,
-				arena_rect_candidate.height,
-			)
-		else:
-			self._arena_rect = None
+		if ratio < target_ratio:
+			width = target_ratio * height
+		elif ratio > target_ratio:
+			height = width / target_ratio
 
 		x_min = center_x - width * 0.5
 		x_max = center_x + width * 0.5
@@ -795,16 +947,13 @@ class PoseScene(PoseSceneCameraMixin):
 			f"[PoseScene] _apply_geometry using active_rect={active_rect} user_override={self._user_camera_override}"
 		)
 
-		active_center_x, active_center_y = active_rect.center
-		active_x_min = active_rect.x
-		active_x_max = active_rect.x + active_rect.width
-		active_y_min = active_rect.y
-		active_y_max = active_rect.y + active_rect.height
-
 		flip_x = self._x_axis_flipped
 		flip_y = self._y_axis_flipped
 
 		self._set_camera_rect(active_rect, flip_x=flip_x, flip_y=flip_y)
+		if rects_changed:
+			self._update_area_overlays()
+		self._update_overlay_label_alpha()
 		print(
 			f"[PoseScene] _apply_geometry completed; current_rect={self._current_view_rect} override={self._override_view_rect}"
 		)
@@ -814,6 +963,7 @@ class PoseScene(PoseSceneCameraMixin):
 		if target_rect is None or target_rect.width <= 0.0 or target_rect.height <= 0.0:
 			self._frame_border.visible = False
 			self._frame_border.set_data(pos=np.zeros((0, 3), dtype=np.float32))
+			self._update_overlay_label_alpha()
 			return
 
 		x_min = target_rect.x
@@ -845,6 +995,137 @@ class PoseScene(PoseSceneCameraMixin):
 			dtype=np.uint32,
 		)
 		self._frame_border.set_data(pos=_ensure_3d(positions), color=color_rgba, width=line_width, connect=indices)
+		self._update_overlay_label_alpha()
+
+	def _update_area_overlays(self) -> None:
+		self._ensure_scene_rects()
+		self._update_overlay_border(self._video_border, self._video_rect, self._video_border_color, width=1.3)
+		self._update_overlay_border(self._arena_border, self._arena_rect, self._arena_border_color, width=1.6)
+		self._update_overlay_labels()
+		self._update_overlay_label_alpha()
+
+	def _update_overlay_border(
+		self,
+		visual: visuals.Line,
+		rect: Optional[SceneRect],
+		color: np.ndarray,
+		*,
+		width: float,
+	) -> None:
+		if rect is None or rect.width <= 0.0 or rect.height <= 0.0:
+			visual.visible = False
+			visual.set_data(pos=np.zeros((0, 3), dtype=np.float32))
+			return
+
+		x_min = float(rect.x)
+		x_max = float(rect.x + rect.width)
+		y_min = float(rect.y)
+		y_max = float(rect.y + rect.height)
+
+		positions = np.array(
+			[
+				[x_min, y_max, 0.0],
+				[x_max, y_max, 0.0],
+				[x_max, y_min, 0.0],
+				[x_min, y_min, 0.0],
+			],
+			dtype=np.float32,
+		)
+		indices = np.array(
+			[
+				[0, 1],
+				[1, 2],
+				[2, 3],
+				[3, 0],
+			],
+			dtype=np.uint32,
+		)
+		color_rgba = np.tile(np.asarray(color, dtype=np.float32), (positions.shape[0], 1))
+		visual.visible = True
+		visual.set_data(pos=_ensure_3d(positions), color=color_rgba, connect=indices, width=float(width))
+
+	def _update_overlay_labels(self) -> None:
+		if self._video_rect is None or self._video_rect.width <= 0.0 or self._video_rect.height <= 0.0:
+			self._video_label.text = ""
+			self._video_label.visible = False
+		else:
+			rect = self._video_rect
+			width_px = float(rect.width)
+			height_px = float(rect.height)
+			text = f"Video {width_px:.0f}px × {height_px:.0f}px"
+			if self._video_label.text != text:
+				self._video_label.text = text
+			center_x = float(rect.x + rect.width * 0.5)
+			top_y = float(rect.y + rect.height)
+			self._video_label.pos = (
+				center_x,
+				top_y + VIDEO_LABEL_OFFSET,
+				0.0,
+			)
+			self._video_label.visible = True
+		if self._arena_rect is None or self._arena_rect.width <= 0.0 or self._arena_rect.height <= 0.0:
+			self._arena_label.text = ""
+			self._arena_label.visible = False
+		else:
+			rect = self._arena_rect
+			width_px = float(rect.width)
+			height_px = float(rect.height)
+			parts = [f"Arena {width_px:.0f}px × {height_px:.0f}px"]
+			if self._arena_size_cm is not None:
+				cm_w, cm_h = self._arena_size_cm
+				if math.isfinite(cm_w) and math.isfinite(cm_h) and cm_w > 0.0 and cm_h > 0.0:
+					parts.append(f"({cm_w:.1f} cm × {cm_h:.1f} cm)")
+			text = " ".join(parts)
+			if self._arena_label.text != text:
+				self._arena_label.text = text
+			center_x = float(rect.x + rect.width * 0.5)
+			bottom_y = float(rect.y)
+			self._arena_label.pos = (
+				center_x,
+				bottom_y - ARENA_LABEL_OFFSET,
+				0.0,
+			)
+			self._arena_label.visible = True
+
+	def _apply_label_alpha(self, label: visuals.Text, base_color: np.ndarray, alpha: float) -> None:
+		alpha_clamped = float(max(0.0, min(1.0, alpha)))
+		if alpha_clamped <= 0.0 or not label.text:
+			label.visible = False
+			return
+		color_rgba = np.asarray(base_color, dtype=np.float32).copy()
+		color_rgba[3] = float(color_rgba[3] * alpha_clamped)
+		label.color = tuple(color_rgba.tolist())
+		label.visible = True
+
+	def _update_overlay_label_alpha(self) -> None:
+		view_rect = self._current_view_rect
+		if view_rect is None or view_rect.width <= 0.0 or view_rect.height <= 0.0:
+			self._apply_label_alpha(self._video_label, self._video_label_base_color, 0.0)
+			self._apply_label_alpha(self._arena_label, self._arena_label_base_color, 0.0)
+			return
+
+		fade_out, fade_in = self._label_fade_thresholds
+		fade_out = float(max(fade_out, 1e-6))
+		fade_in = float(max(fade_in, fade_out + 1e-6))
+
+		def _ratio_for(rect: Optional[SceneRect]) -> float:
+			if rect is None or rect.width <= 0.0 or rect.height <= 0.0:
+				return 0.0
+			width_ratio = view_rect.width / max(rect.width, 1e-9)
+			height_ratio = view_rect.height / max(rect.height, 1e-9)
+			return float(min(width_ratio, height_ratio))
+
+		def _alpha_from_ratio(ratio: float) -> float:
+			if ratio <= fade_out:
+				return 0.0
+			if ratio >= fade_in:
+				return 1.0
+			return (ratio - fade_out) / (fade_in - fade_out)
+
+		video_alpha = _alpha_from_ratio(_ratio_for(self._video_rect))
+		arena_alpha = _alpha_from_ratio(_ratio_for(self._arena_rect))
+		self._apply_label_alpha(self._video_label, self._video_label_base_color, video_alpha)
+		self._apply_label_alpha(self._arena_label, self._arena_label_base_color, arena_alpha)
 
 	def _update_axes_for_rect(self, rect: Optional[SceneRect]) -> None:
 		if rect is None:
@@ -861,6 +1142,7 @@ class PoseScene(PoseSceneCameraMixin):
 		self._current_ylim = y_pair
 		self._update_grid_lines(rect)
 		self._update_scale_bar()
+		self._update_overlay_label_alpha()
 
 	def _clamp_rect_to_bounds(self, rect: SceneRect, bounds: SceneRect) -> SceneRect:
 		width = min(rect.width, bounds.width)
@@ -968,25 +1250,42 @@ class PoseScene(PoseSceneCameraMixin):
 		return [float(val) for val in selected]
 
 	def _update_grid_lines(self, rect: Optional[SceneRect]) -> None:
-		if rect is None or rect.width <= 0.0 or rect.height <= 0.0:
-			self._grid_lines.visible = False
-			self._grid_lines.set_data(pos=np.zeros((0, 3), dtype=np.float32))
-			return
-		grid_bounds = self._arena_rect or self._scene_rect or rect
-		if grid_bounds.width <= 0.0 or grid_bounds.height <= 0.0:
-			grid_bounds = rect
+		def _valid_rect(candidate: Optional[SceneRect]) -> bool:
+			return candidate is not None and candidate.width > 0.0 and candidate.height > 0.0
+
+		video_rect = self._video_rect if _valid_rect(self._video_rect) else None
+		if video_rect is not None:
+			target_rect = video_rect
+			grid_bounds = video_rect
+		else:
+			target_rect = rect if _valid_rect(rect) else None
+			if target_rect is None:
+				for fallback_rect in (self._arena_rect, self._scene_rect, rect):
+					if _valid_rect(fallback_rect):
+						target_rect = fallback_rect
+						break
+			if target_rect is None:
+				self._grid_lines.visible = False
+				self._grid_lines.set_data(pos=np.zeros((0, 3), dtype=np.float32))
+				return
+			if _valid_rect(self._arena_rect):
+				grid_bounds = self._arena_rect  # fall back to legacy alignment when video data is unavailable
+			elif _valid_rect(self._scene_rect):
+				grid_bounds = self._scene_rect
+			else:
+				grid_bounds = target_rect
 		try:
 			scene_transform = self.view.scene.transform
-			origin = scene_transform.map([rect.x, rect.y, 0.0])
-			x_edge = scene_transform.map([rect.x + rect.width, rect.y, 0.0])
-			y_edge = scene_transform.map([rect.x, rect.y + rect.height, 0.0])
+			origin = scene_transform.map([target_rect.x, target_rect.y, 0.0])
+			x_edge = scene_transform.map([target_rect.x + target_rect.width, target_rect.y, 0.0])
+			y_edge = scene_transform.map([target_rect.x, target_rect.y + target_rect.height, 0.0])
 			x_span_px = float(np.linalg.norm(x_edge[:2] - origin[:2]))
 			y_span_px = float(np.linalg.norm(y_edge[:2] - origin[:2]))
 		except Exception:
 			x_span_px = float(self._viewport_size[0])
 			y_span_px = float(self._viewport_size[1])
-		x_pixels_per_unit = x_span_px / max(rect.width, 1e-9)
-		y_pixels_per_unit = y_span_px / max(rect.height, 1e-9)
+		x_pixels_per_unit = x_span_px / max(target_rect.width, 1e-9)
+		y_pixels_per_unit = y_span_px / max(target_rect.height, 1e-9)
 
 		def _dynamic_bins(pixels_per_unit: float, span_px: float) -> int:
 			if not math.isfinite(pixels_per_unit) or pixels_per_unit <= 0.0 or not math.isfinite(span_px) or span_px <= 0.0:
@@ -998,8 +1297,8 @@ class PoseScene(PoseSceneCameraMixin):
 
 		x_bins = _dynamic_bins(x_pixels_per_unit, x_span_px)
 		y_bins = _dynamic_bins(y_pixels_per_unit, y_span_px)
-		x_ticks = self._compute_tick_positions(rect.x, rect.x + rect.width, target_tick_count=x_bins)
-		y_ticks = self._compute_tick_positions(rect.y, rect.y + rect.height, target_tick_count=y_bins)
+		x_ticks = self._compute_tick_positions(target_rect.x, target_rect.x + target_rect.width, target_tick_count=x_bins)
+		y_ticks = self._compute_tick_positions(target_rect.y, target_rect.y + target_rect.height, target_tick_count=y_bins)
 
 		def _extend_ticks(ticks: Sequence[float], lower_bound: float, upper_bound: float) -> List[float]:
 			unique = sorted({float(t) for t in ticks})
@@ -2510,11 +2809,15 @@ class PoseScene(PoseSceneCameraMixin):
 				self._set_hover(None)
 				return
 			x_val, y_val = scene_point
-			arena = self._arena_rect
-			if arena is not None:
+			bounds = self._video_rect
+			if bounds is None or bounds.width <= 0.0 or bounds.height <= 0.0:
+				arena = self._arena_rect
+				if arena is not None and arena.width > 0.0 and arena.height > 0.0:
+					bounds = arena
+			if bounds is not None:
 				if not (
-					arena.x - 1e-6 <= x_val <= arena.x + arena.width + 1e-6
-					and arena.y - 1e-6 <= y_val <= arena.y + arena.height + 1e-6
+					bounds.x - 1e-6 <= x_val <= bounds.x + bounds.width + 1e-6
+					and bounds.y - 1e-6 <= y_val <= bounds.y + bounds.height + 1e-6
 				):
 					self._set_hover(None)
 					return

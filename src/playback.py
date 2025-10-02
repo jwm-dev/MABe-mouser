@@ -471,14 +471,44 @@ class PoseViewerPlaybackMixin(PoseViewerGeometryMixin):
         metadata_obj = self.current_data.get("metadata") if isinstance(self.current_data, dict) else None
         metadata = metadata_obj if isinstance(metadata_obj, dict) else {}
         metadata_mapping: Mapping[str, Any] = metadata if isinstance(metadata, Mapping) else {}
-        video_size = None
-        arena_size = None
-        video_dims = self._metadata_video_size_px(metadata_mapping) if metadata_mapping else (None, None)
-        arena_dims = self._metadata_arena_size_px(metadata_mapping) if metadata_mapping else (None, None)
-        if all(value is not None for value in video_dims):
-            video_size = (float(video_dims[0]), float(video_dims[1]))  # type: ignore[index]
-        if all(value is not None for value in arena_dims):
-            arena_size = (float(arena_dims[0]), float(arena_dims[1]))  # type: ignore[index]
+        video_size: Optional[Tuple[float, float]] = None
+        arena_size_px: Optional[Tuple[float, float]] = None
+        arena_size_cm: Optional[Tuple[float, float]] = None
+
+        data_video_size = self.current_data.get("video_size_px") if isinstance(self.current_data, dict) else None
+        if isinstance(data_video_size, (tuple, list)) and len(data_video_size) >= 2:
+            try:
+                video_size = (float(data_video_size[0]), float(data_video_size[1]))
+            except (TypeError, ValueError):
+                video_size = None
+        if video_size is None and metadata_mapping:
+            video_dims = self._metadata_video_size_px(metadata_mapping)
+            if all(value is not None for value in video_dims):
+                video_size = (float(video_dims[0]), float(video_dims[1]))  # type: ignore[index]
+
+        data_arena_size_px = self.current_data.get("arena_size_px") if isinstance(self.current_data, dict) else None
+        if isinstance(data_arena_size_px, (tuple, list)) and len(data_arena_size_px) >= 2:
+            try:
+                arena_size_px = (float(data_arena_size_px[0]), float(data_arena_size_px[1]))
+            except (TypeError, ValueError):
+                arena_size_px = None
+        if arena_size_px is None and metadata_mapping:
+            arena_dims = self._metadata_arena_size_px(metadata_mapping)
+            if all(value is not None for value in arena_dims):
+                arena_size_px = (float(arena_dims[0]), float(arena_dims[1]))  # type: ignore[index]
+
+        data_arena_size_cm = self.current_data.get("arena_size_cm") if isinstance(self.current_data, dict) else None
+        if isinstance(data_arena_size_cm, (tuple, list)) and len(data_arena_size_cm) >= 2:
+            try:
+                arena_size_cm = (float(data_arena_size_cm[0]), float(data_arena_size_cm[1]))
+            except (TypeError, ValueError):
+                arena_size_cm = None
+        if arena_size_cm is None and metadata_mapping:
+            width_cm = metadata_mapping.get("arena_width_cm")
+            height_cm = metadata_mapping.get("arena_height_cm")
+            if isinstance(width_cm, (int, float)) and isinstance(height_cm, (int, float)):
+                if math.isfinite(float(width_cm)) and math.isfinite(float(height_cm)):
+                    arena_size_cm = (float(width_cm), float(height_cm))
         raw_domain_xlim = self.current_data.get("domain_xlim") if isinstance(self.current_data, dict) else None
         raw_domain_ylim = self.current_data.get("domain_ylim") if isinstance(self.current_data, dict) else None
         if isinstance(raw_domain_xlim, (tuple, list)) and len(raw_domain_xlim) >= 2:
@@ -489,20 +519,33 @@ class PoseViewerPlaybackMixin(PoseViewerGeometryMixin):
             domain_ylim = (raw_domain_ylim[0], raw_domain_ylim[1])
         else:
             domain_ylim = (None, None)
-        if arena_size is None:
+        if arena_size_px is None:
             dx_min, dx_max = domain_xlim
             dy_min, dy_max = domain_ylim
             if all(isinstance(val, (int, float)) and math.isfinite(float(val)) for val in (dx_min, dx_max, dy_min, dy_max)):
                 width_val = float(dx_max) - float(dx_min)
                 height_val = float(dy_max) - float(dy_min)
                 if width_val > 0.0 and height_val > 0.0:
-                    arena_size = (width_val, height_val)
+                    arena_size_px = (width_val, height_val)
 
-        cm_per_pixel = self._resolve_cm_per_pixel(metadata_mapping, domain_xlim, domain_ylim)
+        cm_per_pixel_value = None
+        cm_per_pixel_data = self.current_data.get("cm_per_pixel") if isinstance(self.current_data, dict) else None
+        if isinstance(cm_per_pixel_data, (int, float)) and math.isfinite(float(cm_per_pixel_data)) and float(cm_per_pixel_data) > 0.0:
+            cm_per_pixel_value = float(cm_per_pixel_data)
+        elif metadata_mapping:
+            candidate = metadata_mapping.get("cm_per_pixel")
+            if isinstance(candidate, (int, float)) and math.isfinite(float(candidate)) and float(candidate) > 0.0:
+                cm_per_pixel_value = float(candidate)
+
+        cm_per_pixel = cm_per_pixel_value or self._resolve_cm_per_pixel(metadata_mapping, domain_xlim, domain_ylim)
         self._cm_per_pixel = cm_per_pixel
         self._unit_label = "pixels"
         self.scene.set_unit_scale(cm_per_pixel=cm_per_pixel)
-        self.scene.set_scene_dimensions(video_size=video_size, arena_size=arena_size)
+        self.scene.set_scene_dimensions(
+            video_size=video_size,
+            arena_size=arena_size_px,
+            arena_size_cm=arena_size_cm,
+        )
         if isinstance(aspect_value, (int, float)) and math.isfinite(float(aspect_value)) and float(aspect_value) > 0.0:
             aspect = float(aspect_value)
         else:

@@ -1014,184 +1014,90 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
         arena_width_px, arena_height_px = self._metadata_arena_size_px(metadata)
         video_width_px, video_height_px = self._metadata_video_size_px(metadata)
 
+        cm_per_pixel = self._coerce_positive_float(metadata.get("cm_per_pixel")) if metadata else None
+        pixels_per_cm = self._coerce_positive_float(metadata.get("pixels_per_cm") or metadata.get("pix_per_cm_approx")) if metadata else None
+        arena_width_cm = self._coerce_positive_float(metadata.get("arena_width_cm")) if metadata else None
+        arena_height_cm = self._coerce_positive_float(metadata.get("arena_height_cm")) if metadata else None
+
+        if arena_width_px is None and pixels_per_cm and arena_width_cm:
+            arena_width_px = float(pixels_per_cm) * float(arena_width_cm)
+            metadata["arena_width_px"] = arena_width_px
+        if arena_height_px is None and pixels_per_cm and arena_height_cm:
+            arena_height_px = float(pixels_per_cm) * float(arena_height_cm)
+            metadata["arena_height_px"] = arena_height_px
+        if cm_per_pixel is None and pixels_per_cm:
+            cm_per_pixel = 1.0 / float(pixels_per_cm)
+        if metadata is not None and cm_per_pixel:
+            metadata.setdefault("cm_per_pixel", float(cm_per_pixel))
+
         if metadata:
-            pixels_per_cm = metadata.get("pixels_per_cm") or metadata.get("pix_per_cm_approx")
-            arena_width_cm = metadata.get("arena_width_cm")
-            arena_height_cm = metadata.get("arena_height_cm")
-            if arena_width_px is None and _valid(pixels_per_cm) and _valid(arena_width_cm):
-                arena_width_px = float(pixels_per_cm) * float(arena_width_cm)
-                metadata["arena_width_px"] = arena_width_px
-            if arena_height_px is None and _valid(pixels_per_cm) and _valid(arena_height_cm):
-                arena_height_px = float(pixels_per_cm) * float(arena_height_cm)
-                metadata["arena_height_px"] = arena_height_px
+            arena_section = metadata.get("arena") if isinstance(metadata.get("arena"), dict) else {}
+            if arena_width_cm is not None:
+                arena_section.setdefault("width_cm", float(arena_width_cm))
+            if arena_height_cm is not None:
+                arena_section.setdefault("height_cm", float(arena_height_cm))
+            if arena_width_px is not None:
+                arena_section.setdefault("width_px", float(arena_width_px))
+            if arena_height_px is not None:
+                arena_section.setdefault("height_px", float(arena_height_px))
+            if arena_section:
+                metadata["arena"] = arena_section
 
-        data_x_lower = x_min - pad_x_data
-        data_x_upper = x_max + pad_x_data
-        data_y_lower = y_min - pad_y_data
-        data_y_upper = y_max + pad_y_data
+        data_x_lower = x_min
+        data_x_upper = x_max
+        data_y_lower = y_min
+        data_y_upper = y_max
 
-        bounds_x_lower = data_x_lower
-        bounds_x_upper = data_x_upper
-        bounds_y_lower = data_y_lower
-        bounds_y_upper = data_y_upper
+        domain_x_lower = 0.0
+        domain_y_lower = 0.0
+        domain_x_upper_candidates: List[float] = []
+        domain_y_upper_candidates: List[float] = []
+        if video_width_px is not None:
+            domain_x_upper_candidates.append(float(video_width_px))
+        if arena_width_px is not None:
+            domain_x_upper_candidates.append(float(arena_width_px))
+        if video_height_px is not None:
+            domain_y_upper_candidates.append(float(video_height_px))
+        if arena_height_px is not None:
+            domain_y_upper_candidates.append(float(arena_height_px))
+        domain_x_upper_candidates.append(float(data_x_upper + pad_x_data))
+        domain_y_upper_candidates.append(float(data_y_upper + pad_y_data))
+        domain_x_upper = max(value for value in domain_x_upper_candidates if math.isfinite(value)) if domain_x_upper_candidates else float(data_x_upper + pad_x_data)
+        domain_y_upper = max(value for value in domain_y_upper_candidates if math.isfinite(value)) if domain_y_upper_candidates else float(data_y_upper + pad_y_data)
 
-        data_center_x = (data_x_lower + data_x_upper) * 0.5
-        data_center_y = (data_y_lower + data_y_upper) * 0.5
-        center_x = data_center_x
-        center_y = data_center_y
+        view_x_lower = float(min(0.0, data_x_lower - pad_x_data))
+        view_y_lower = float(min(0.0, data_y_lower - pad_y_data))
+        view_x_upper = float(max(domain_x_upper, data_x_upper + pad_x_data))
+        view_y_upper = float(max(domain_y_upper, data_y_upper + pad_y_data))
 
-        target_ratio: Optional[float] = None
-        preferred_center: Optional[Tuple[float, float]] = None
+        if not math.isfinite(view_x_lower):
+            view_x_lower = 0.0
+        if not math.isfinite(view_y_lower):
+            view_y_lower = 0.0
+        if not math.isfinite(view_x_upper):
+            view_x_upper = max(1.0, float(data_x_upper if math.isfinite(data_x_upper) else 1.0))
+        if not math.isfinite(view_y_upper):
+            view_y_upper = max(1.0, float(data_y_upper if math.isfinite(data_y_upper) else 1.0))
 
-        domain_x_lower: Optional[float] = None
-        domain_x_upper: Optional[float] = None
-        domain_y_lower: Optional[float] = None
-        domain_y_upper: Optional[float] = None
+        xlim = (view_x_lower, view_x_upper)
+        ylim = (view_y_lower, view_y_upper)
 
-        if _valid(arena_width_px) and _valid(arena_height_px):
-            arena_w = float(arena_width_px)
-            arena_h = float(arena_height_px)
-            arena_pad_x = max(pad_x_data, arena_w * 0.03)
-            arena_pad_y = max(pad_y_data, arena_h * 0.03)
-            bounds_x_lower = min(bounds_x_lower, 0.0)
-            bounds_x_upper = max(bounds_x_upper, arena_w + arena_pad_x)
-            bounds_y_lower = min(bounds_y_lower, 0.0)
-            bounds_y_upper = max(bounds_y_upper, arena_h + arena_pad_y)
-            target_ratio = arena_w / max(arena_h, 1e-6)
-            preferred_center = (arena_w * 0.5, arena_h * 0.5)
-            domain_x_lower = 0.0
-            domain_x_upper = arena_w
-            domain_y_lower = 0.0
-            domain_y_upper = arena_h
-        elif _valid(video_width_px) and _valid(video_height_px):
-            video_w = float(video_width_px)
-            video_h = float(video_height_px)
-            video_pad_x = max(pad_x_data, video_w * 0.03)
-            video_pad_y = max(pad_y_data, video_h * 0.03)
-            bounds_x_lower = min(bounds_x_lower, 0.0)
-            bounds_x_upper = max(bounds_x_upper, video_w + video_pad_x)
-            bounds_y_lower = min(bounds_y_lower, 0.0)
-            bounds_y_upper = max(bounds_y_upper, video_h + video_pad_y)
-            target_ratio = video_w / max(video_h, 1e-6)
-            preferred_center = (video_w * 0.5, video_h * 0.5)
-            domain_x_lower = 0.0
-            domain_x_upper = video_w
-            domain_y_lower = 0.0
-            domain_y_upper = video_h
+        width_estimate = max(view_x_upper - view_x_lower, 1.0)
+        height_estimate = max(view_y_upper - view_y_lower, 1.0)
+        aspect_candidates: List[float] = []
+        if video_width_px and video_height_px and video_height_px > 0:
+            aspect_candidates.append(float(video_width_px) / float(video_height_px))
+        if arena_width_px and arena_height_px and arena_height_px > 0:
+            aspect_candidates.append(float(arena_width_px) / float(arena_height_px))
+        if height_estimate > 0.0:
+            aspect_candidates.append(width_estimate / height_estimate)
+        target_ratio = next((ratio for ratio in aspect_candidates if math.isfinite(ratio) and ratio > 0.0), 1.0)
+        target_ratio = float(max(target_ratio, 1e-6))
 
-        half_width = max(
-            center_x - bounds_x_lower,
-            bounds_x_upper - center_x,
-            pad_x_data,
-            0.5,
+        display_center = (
+            (xlim[0] + xlim[1]) * 0.5,
+            (ylim[0] + ylim[1]) * 0.5,
         )
-        half_height = max(
-            center_y - bounds_y_lower,
-            bounds_y_upper - center_y,
-            pad_y_data,
-            0.5,
-        )
-
-        if preferred_center:
-            half_width = max(half_width, abs(preferred_center[0] - center_x) + pad_x_data)
-            half_height = max(half_height, abs(preferred_center[1] - center_y) + pad_y_data)
-
-        width = max(half_width * 2.0, 1.0)
-        height = max(half_height * 2.0, 1.0)
-
-        if target_ratio is None:
-            arena_ratio = metadata.get("arena_aspect_ratio") if metadata else None
-            video_ratio = metadata.get("video_aspect_ratio") if metadata else None
-            if _valid(arena_ratio):
-                target_ratio = float(arena_ratio)
-            elif _valid(video_ratio):
-                target_ratio = float(video_ratio)
-            elif height > 1e-6:
-                target_ratio = max(width / max(height, 1e-6), 1e-6)
-            else:
-                target_ratio = 1.0
-
-        target_ratio = float(max(target_ratio or 1.0, 1e-6))
-
-        current_ratio = width / height if height > 1e-6 else target_ratio
-        if current_ratio < target_ratio:
-            required_width = target_ratio * height
-            half_width = max(half_width, required_width * 0.5)
-        elif current_ratio > target_ratio:
-            required_height = width / target_ratio
-            half_height = max(half_height, required_height * 0.5)
-
-        half_width = max(
-            half_width,
-            center_x - bounds_x_lower,
-            bounds_x_upper - center_x,
-        )
-        half_height = max(
-            half_height,
-            center_y - bounds_y_lower,
-            bounds_y_upper - center_y,
-        )
-
-        width = max(half_width * 2.0, 1.0)
-        height = max(half_height * 2.0, 1.0)
-
-        x_lower = center_x - half_width
-        x_upper = center_x + half_width
-        y_lower = center_y - half_height
-        y_upper = center_y + half_height
-
-        # If metadata-derived domains exist, expand them to include the observed data bounds so
-        # that downstream geometry never clips the trajectories when arena information is smaller
-        # than the actual tracking coordinates. This also keeps the aspect logic squarely focused on
-        # the arena ratio while letting the view grow to fit the data envelope.
-        if domain_x_lower is not None:
-            domain_x_lower = float(min(domain_x_lower, data_x_lower))
-        if domain_x_upper is not None:
-            domain_x_upper = float(max(domain_x_upper, data_x_upper))
-        if domain_y_lower is not None:
-            domain_y_lower = float(min(domain_y_lower, data_y_lower))
-        if domain_y_upper is not None:
-            domain_y_upper = float(max(domain_y_upper, data_y_upper))
-
-        if domain_x_lower is not None:
-            domain_x_lower = float(min(domain_x_lower, x_min))
-        if domain_x_upper is not None:
-            domain_x_upper = float(max(domain_x_upper, x_max))
-        if domain_y_lower is not None:
-            domain_y_lower = float(min(domain_y_lower, max(y_min, 0.0)))
-        if domain_y_upper is not None:
-            domain_y_upper = float(max(domain_y_upper, y_max))
-
-        if domain_x_lower is not None and domain_x_upper is not None:
-            x_lower = float(domain_x_lower)
-            x_upper = float(domain_x_upper)
-            width = max(x_upper - x_lower, 1.0)
-            center_x = (x_lower + x_upper) * 0.5
-        if domain_y_lower is not None and domain_y_upper is not None:
-            y_lower = float(domain_y_lower)
-            y_upper = float(domain_y_upper)
-            height = max(y_upper - y_lower, 1.0)
-            center_y = (y_lower + y_upper) * 0.5
-
-        if domain_x_lower is not None and x_lower < domain_x_lower:
-            shift = domain_x_lower - x_lower
-            x_lower += shift
-            x_upper += shift
-        if domain_y_lower is not None and y_lower < domain_y_lower:
-            shift = domain_y_lower - y_lower
-            y_lower += shift
-            y_upper += shift
-
-        if domain_x_upper is not None and x_upper < domain_x_upper:
-            x_upper = domain_x_upper
-        if domain_y_upper is not None and y_upper < domain_y_upper:
-            y_upper = domain_y_upper
-
-        center_x = (x_lower + x_upper) * 0.5
-        center_y = (y_lower + y_upper) * 0.5
-
-        xlim = (x_lower, x_upper)
-        ylim = (y_lower, y_upper)
 
         result: Dict[str, object] = {
             "frames": frames,
@@ -1201,7 +1107,7 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
             "mouse_ids": sorted(mouse_ids),
             "has_behaviors": bool(behavior_map),
             "display_aspect_ratio": target_ratio,
-            "display_center": (center_x, center_y),
+            "display_center": display_center,
         }
 
         if domain_x_lower is not None or domain_x_upper is not None:
@@ -1215,11 +1121,20 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
                 float(domain_y_upper) if domain_y_upper is not None else None,
             )
 
+        if video_width_px is not None and video_height_px is not None:
+            result["video_size_px"] = (float(video_width_px), float(video_height_px))
+        if arena_width_px is not None and arena_height_px is not None:
+            result["arena_size_px"] = (float(arena_width_px), float(arena_height_px))
+        if arena_width_cm is not None and arena_height_cm is not None:
+            result["arena_size_cm"] = (float(arena_width_cm), float(arena_height_cm))
+        if cm_per_pixel is not None:
+            result["cm_per_pixel"] = float(cm_per_pixel)
+
         if metadata:
             self._augment_tracking_metadata(metadata)
             metadata.setdefault("display_aspect_ratio", target_ratio)
-            metadata.setdefault("display_center_x", center_x)
-            metadata.setdefault("display_center_y", center_y)
+            metadata.setdefault("display_center_x", display_center[0])
+            metadata.setdefault("display_center_y", display_center[1])
             result["metadata"] = metadata
 
         return result
