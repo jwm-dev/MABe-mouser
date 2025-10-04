@@ -14,6 +14,9 @@ from .optional_dependencies import imageio
 
 class PoseViewerExportMixin:
     def _export_current_video(self) -> None:
+        # Pause playback immediately before showing the dialog
+        self._force_pause_playback()
+        
         if not self.current_data:
             self._show_info("No data loaded", "Load a tracking file before exporting.")
             return
@@ -104,8 +107,6 @@ class PoseViewerExportMixin:
 
         original_index = int(self.frame_slider.value())
         original_status = self.status_var.get()
-        original_progress_range = (self.progressbar.minimum(), self.progressbar.maximum())
-        original_progress_value = self.progress_var.get()
         was_playing = self.playing
 
         self._force_pause_playback()
@@ -113,8 +114,11 @@ class PoseViewerExportMixin:
             self.export_action.setEnabled(False)
         if hasattr(self, "export_button"):
             self.export_button.setEnabled(False)
-        self.progressbar.setRange(0, 100)
-        self.progress_var.set(0.0)
+        
+        tab_loader = getattr(self, "_set_tab_loading", None)
+        if callable(tab_loader):
+            tab_loader("viewer", True, f"Exporting {destination.name}…")
+        
         self._set_status(f"Exporting {destination.name}…")
         try:
             with writer:
@@ -126,8 +130,8 @@ class PoseViewerExportMixin:
                         frame_rgb = self._ensure_even_dimensions(frame_rgb)
                     writer.append_data(frame_rgb)
 
-                    progress = (frame_idx + 1) / total
-                    self.progress_var.set(progress * 100.0)
+                    if callable(tab_loader):
+                        tab_loader("viewer", True, f"Exporting {destination.name} ({frame_idx + 1}/{total})…")
                     self._set_status(f"Exporting {destination.name} ({frame_idx + 1}/{total})…")
                     QtWidgets.QApplication.processEvents()
         finally:
@@ -137,8 +141,8 @@ class PoseViewerExportMixin:
             if self.current_data:
                 self._render_frame(original_index)
 
-            self.progressbar.setRange(*original_progress_range)
-            self.progress_var.set(original_progress_value)
+            if callable(tab_loader):
+                tab_loader("viewer", False, None)
             self._set_status(original_status)
             if hasattr(self, "export_action"):
                 self.export_action.setEnabled(True)

@@ -56,10 +56,13 @@ class WindowControlButton(QtWidgets.QToolButton):
 class CustomTitleBar(QtWidgets.QFrame):
 	"""A frameless window title bar with themed styling and actions."""
 
+	viewChanged = QtCore.pyqtSignal(str)
+
 	def __init__(self, window: QtWidgets.QWidget) -> None:
 		super().__init__(window)
 		self._window = window
 		self._drag_offset = QtCore.QPoint()
+		self._active_view = "viewer"
 
 		self.setObjectName("CustomTitleBar")
 		self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
@@ -76,6 +79,26 @@ class CustomTitleBar(QtWidgets.QFrame):
 				color: {UI_TEXT_PRIMARY};
 				padding: 4px 10px;
 				border-radius: 6px;
+			}}
+			QToolButton#TitleTabButton {{
+				background: rgba(47, 134, 255, 0.08);
+				color: {UI_TEXT_PRIMARY};
+				padding: 4px 14px;
+				border-radius: 18px;
+				border: 1px solid rgba(47, 134, 255, 0.24);
+				font-weight: 500;
+			}}
+			QToolButton#TitleTabButton:hover {{
+				background: rgba(47, 134, 255, 0.16);
+			}}
+			QToolButton#TitleTabButton:checked {{
+				background: rgba(47, 134, 255, 0.32);
+				border-color: rgba(47, 134, 255, 0.6);
+			}}
+			QToolButton#TitleTabButton:disabled {{
+				color: {UI_TEXT_MUTED};
+				border-color: rgba(47, 134, 255, 0.12);
+				background: rgba(47, 134, 255, 0.06);
 			}}
 			QToolButton#WindowMinButton,
 			QToolButton#WindowMaxButton,
@@ -146,6 +169,45 @@ class CustomTitleBar(QtWidgets.QFrame):
 		text_container.setLayout(title_container)
 		layout.addWidget(text_container)
 
+		layout.addSpacing(12)
+
+		self._view_group = QtWidgets.QButtonGroup(self)
+		self._view_group.setExclusive(True)
+
+		self.viewer_button = QtWidgets.QToolButton(self)
+		self.viewer_button.setObjectName("TitleTabButton")
+		self.viewer_button.setCheckable(True)
+		self.viewer_button.setChecked(True)
+		self.viewer_button.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+		self.viewer_button.setText("Viewer")
+		self.viewer_button.clicked.connect(lambda checked: self._handle_view_button("viewer"))
+		self._view_group.addButton(self.viewer_button)
+
+		self.graphs_button = QtWidgets.QToolButton(self)
+		self.graphs_button.setObjectName("TitleTabButton")
+		self.graphs_button.setCheckable(True)
+		self.graphs_button.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+		self.graphs_button.setText("Graphs")
+		self.graphs_button.clicked.connect(lambda checked: self._handle_view_button("graphs"))
+		self._view_group.addButton(self.graphs_button)
+
+		self.tables_button = QtWidgets.QToolButton(self)
+		self.tables_button.setObjectName("TitleTabButton")
+		self.tables_button.setCheckable(True)
+		self.tables_button.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+		self.tables_button.setText("Analysis")
+		self.tables_button.clicked.connect(lambda checked: self._handle_view_button("tables"))
+		self._view_group.addButton(self.tables_button)
+
+		view_toggle_container = QtWidgets.QWidget(self)
+		view_toggle_layout = QtWidgets.QHBoxLayout(view_toggle_container)
+		view_toggle_layout.setContentsMargins(0, 0, 0, 0)
+		view_toggle_layout.setSpacing(6)
+		view_toggle_layout.addWidget(self.viewer_button)
+		view_toggle_layout.addWidget(self.graphs_button)
+		view_toggle_layout.addWidget(self.tables_button)
+		layout.addWidget(view_toggle_container)
+
 		layout.addStretch(1)
 
 		self.open_action = QtGui.QAction("Open Folder…", self)
@@ -206,6 +268,21 @@ class CustomTitleBar(QtWidgets.QFrame):
 	def set_subtitle(self, subtitle: str) -> None:
 		self.subtitle_label.setText(subtitle)
 		self.subtitle_label.setVisible(bool(subtitle))
+
+	def set_active_view(self, key: str) -> None:
+		key = key if key in {"viewer", "graphs", "tables"} else "viewer"
+		self._active_view = key
+		with QtCore.QSignalBlocker(self.viewer_button), QtCore.QSignalBlocker(self.graphs_button), QtCore.QSignalBlocker(self.tables_button):
+			self.viewer_button.setChecked(key == "viewer")
+			self.graphs_button.setChecked(key == "graphs")
+			self.tables_button.setChecked(key == "tables")
+
+	def _handle_view_button(self, key: str) -> None:
+		if key == self._active_view:
+			return
+		self._active_view = key
+		self.set_active_view(key)
+		self.viewChanged.emit(key)
 
 	def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:  # noqa: N802
 		if watched is self._window and event.type() == QtCore.QEvent.Type.WindowStateChange:

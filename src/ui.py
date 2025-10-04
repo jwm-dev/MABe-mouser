@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 import numpy as np
 
+from .analysis import AnalysisPane
 from .bar import CustomTitleBar
 from .constants import UI_ACCENT, UI_BACKGROUND, UI_SURFACE, UI_TEXT_MUTED, UI_TEXT_PRIMARY
 from .plotting import PoseScene, create_scene_canvas
@@ -29,6 +30,119 @@ class BindingVar:
 
     def get(self) -> Any:
         return self._value
+
+
+class BusySpinner(QtWidgets.QWidget):
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None, *, diameter: int = 44, line_width: float = 3.0, interval_ms: int = 80) -> None:
+        super().__init__(parent)
+        self._diameter = diameter
+        self._line_width = line_width
+        self._interval = max(16, int(interval_ms))
+        self._angle = 0
+        self._line_count = 12
+        self._timer = QtCore.QTimer(self)
+        self._timer.timeout.connect(self._advance)
+        self.setMinimumSize(diameter, diameter)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+    def start(self) -> None:
+        if not self._timer.isActive():
+            self._timer.start(self._interval)
+
+    def stop(self) -> None:
+        self._timer.stop()
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:  # noqa: N802
+        self.start()
+        super().showEvent(event)
+
+    def hideEvent(self, event: QtGui.QHideEvent) -> None:  # noqa: N802
+        self.stop()
+        super().hideEvent(event)
+
+    def _advance(self) -> None:
+        self._angle = (self._angle + 30) % 360
+        self.update()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        center = self.rect().center()
+        radius = min(self.width(), self.height()) / 2.0 - self._line_width
+        if radius <= 0:
+            return
+        for i in range(self._line_count):
+            angle = (360 / self._line_count) * i + self._angle
+            opacity = 0.2 + (0.8 * i / self._line_count)
+            color = QtGui.QColor(UI_ACCENT)
+            color.setAlphaF(max(0.0, min(1.0, opacity)))
+            painter.save()
+            painter.translate(center)
+            painter.rotate(angle)
+            pen = QtGui.QPen(color)
+            pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+            pen.setWidthF(self._line_width)
+            painter.setPen(pen)
+            painter.drawLine(QtCore.QPointF(0, -radius), QtCore.QPointF(0, -radius / 2.2))
+            painter.restore()
+
+
+class LoadingOverlay(QtWidgets.QWidget):
+    def __init__(self, parent: QtWidgets.QWidget, *, message: str = "Loading…") -> None:
+        super().__init__(parent)
+        self._message = message
+        self._spinner = BusySpinner(self, diameter=48)
+        self._label = QtWidgets.QLabel(message, self)
+        self._label.setStyleSheet("color: #f1f5ff; font-weight: 600; font-size: 14px;")
+        self._label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addStretch(1)
+        layout.addWidget(self._spinner, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
+        layout.addSpacing(10)
+        layout.addWidget(self._label, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
+        layout.addStretch(2)
+        self.setVisible(False)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.setAutoFillBackground(False)
+        parent.installEventFilter(self)
+        self._sync_geometry()
+
+    def set_loading(self, active: bool, message: Optional[str] = None) -> None:
+        if message:
+            self._message = message
+            self._label.setText(message)
+        if active:
+            self._spinner.start()
+            self._sync_geometry()
+            self.show()
+            self.raise_()
+        else:
+            self._spinner.stop()
+            self.hide()
+
+    def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:  # noqa: N802
+        if watched is self.parent() and event.type() in {
+            QtCore.QEvent.Type.Resize,
+            QtCore.QEvent.Type.Move,
+            QtCore.QEvent.Type.Show,
+        }:
+            self._sync_geometry()
+        return super().eventFilter(watched, event)
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        gradient = QtGui.QLinearGradient(0, 0, 0, self.height())
+        gradient.setColorAt(0.0, QtGui.QColor(13, 18, 32, 140))
+        gradient.setColorAt(1.0, QtGui.QColor(13, 18, 32, 220))
+        painter.fillRect(self.rect(), gradient)
+
+    def _sync_geometry(self) -> None:
+        parent = self.parent()
+        if isinstance(parent, QtWidgets.QWidget):
+            self.setGeometry(parent.rect())
 
 
 class ClickableSlider(QtWidgets.QSlider):
@@ -271,13 +385,6 @@ class PoseViewerUIMixin:
             QToolButton#TitleLabel::menu-indicator { image: none; }
             QToolButton#TitleLabel:hover { color: #ffffff; }
             QLabel#BehaviorLabel { color: #95a3c4; font-size: 12px; }
-            QProgressBar {
-                background: #111a30;
-                border: 1px solid #1c2740;
-                border-radius: 4px;
-                padding: 1px;
-            }
-            QProgressBar::chunk { background: #2f86ff; border-radius: 4px; }
             """
         )
 
@@ -290,6 +397,8 @@ class PoseViewerUIMixin:
         self.title_bar.export_action.triggered.connect(self._export_current_video)
         self.export_action = self.title_bar.export_action
         self.export_button = self.title_bar.export_button
+        self.title_bar.viewChanged.connect(self._handle_view_mode_change)
+        self.title_bar.set_active_view("viewer")
         root.windowTitleChanged.connect(self.title_bar.set_title)
         main_layout.addWidget(self.title_bar)
 
@@ -346,21 +455,30 @@ class PoseViewerUIMixin:
 
         main_layout.addWidget(top_bar)
 
-        figure_frame = QtWidgets.QFrame(central)
+        self.content_stack = QtWidgets.QStackedWidget(central)
+        self.content_stack.setObjectName("MainContentStack")
+        main_layout.addWidget(self.content_stack, 1)
+
+        viewer_container = QtWidgets.QWidget(self.content_stack)
+        viewer_layout = QtWidgets.QVBoxLayout(viewer_container)
+        viewer_layout.setContentsMargins(0, 4, 0, 0)
+        viewer_layout.setSpacing(8)
+
+        figure_frame = QtWidgets.QFrame(viewer_container)
         figure_layout = QtWidgets.QVBoxLayout(figure_frame)
         figure_layout.setContentsMargins(0, 0, 0, 0)
         figure_layout.setSpacing(0)
         self.scene: PoseScene = create_scene_canvas(parent=figure_frame)
         canvas_widget = self.scene.native_widget()
         figure_layout.addWidget(canvas_widget, 1)
-        main_layout.addWidget(figure_frame, 1)
+        viewer_layout.addWidget(figure_frame, 1)
 
-        self.behavior_label = QtWidgets.QLabel("", central)
+        self.behavior_label = QtWidgets.QLabel("", viewer_container)
         self.behavior_label.setObjectName("BehaviorLabel")
         self.behavior_label.setContentsMargins(14, 6, 14, 6)
-        main_layout.addWidget(self.behavior_label)
+        viewer_layout.addWidget(self.behavior_label)
 
-        controls_frame = QtWidgets.QFrame(central)
+        controls_frame = QtWidgets.QFrame(viewer_container)
         controls_layout = QtWidgets.QGridLayout(controls_frame)
         controls_layout.setContentsMargins(12, 10, 12, 12)
         controls_layout.setHorizontalSpacing(10)
@@ -443,22 +561,80 @@ class PoseViewerUIMixin:
         controls_layout.setColumnStretch(3, 1)
         controls_layout.setColumnStretch(4, 0)
 
-        main_layout.addWidget(controls_frame)
+        viewer_layout.addWidget(controls_frame)
+
+        self.content_stack.addWidget(viewer_container)
+        self.viewer_container = viewer_container
+        self.viewer_overlay = LoadingOverlay(viewer_container, message="Loading viewer…")
+
+        # Create analysis pane with executor and dataset stats
+        executor = getattr(self, "_io_executor", None)
+        dataset_stats = getattr(self, "_dataset_stats", None)
+        on_main_thread = getattr(self, "_invoke_on_main_thread", None)
+        
+        # Create graphs pane for visual analysis
+        from .graphs import GraphsPane
+        self.graphs_pane = GraphsPane(
+            parent=self.content_stack,
+            executor=executor,
+            dataset_stats=dataset_stats,
+            on_main_thread=on_main_thread
+        )
+        
+        # Connect signal to hide loading overlay
+        self.graphs_pane.graphs_complete.connect(
+            lambda: self._on_graphs_complete()
+        )
+        
+        self.content_stack.addWidget(self.graphs_pane)
+        
+        # Create analysis pane for statistical analysis
+        self.analysis_pane = AnalysisPane(
+            parent=self.content_stack,
+            executor=executor,
+            dataset_stats=dataset_stats,
+            on_main_thread=on_main_thread
+        )
+        
+        # Connect signal to hide loading overlay
+        self.analysis_pane.analysis_complete.connect(
+            lambda: self._on_analysis_complete()
+        )
+        
+        self.content_stack.addWidget(self.analysis_pane)
+        self.content_stack.setCurrentWidget(viewer_container)
+        self._active_view = "viewer"
+        
+        # Analysis tab state
+        self._tables_visible = False
+        self._tables_current_path: Optional[Path] = None
+        self._tables_current_payload: Optional[Dict[str, object]] = None
+        self._tables_dirty = True
+        self._tables_prepared_payload: Optional[Dict[str, object]] = None
+        self._analysis_loaded_path: Optional[Path] = None  # Track which file analysis has processed
+        self._analysis_is_loading = False  # Track if analysis is currently loading
+        self.tables_overlay = LoadingOverlay(self.analysis_pane, message="Preparing analysis…")
+        
+        # Graphs tab state  
+        self._graphs_visible = False
+        self._graphs_current_path: Optional[Path] = None
+        self._graphs_current_payload: Optional[Dict[str, object]] = None
+        self._graphs_dirty = True
+        self._graphs_loaded_path: Optional[Path] = None
+        self._graphs_is_loading = False
+        self.graphs_overlay = LoadingOverlay(self.graphs_pane, message="Rendering graphs…")
+        
+        # Track preloading state
+        self._preload_in_progress = False
 
         status_frame = QtWidgets.QFrame(central)
-        status_layout = QtWidgets.QVBoxLayout(status_frame)
-        status_layout.setContentsMargins(12, 6, 12, 10)
+        status_layout = QtWidgets.QHBoxLayout(status_frame)
+        status_layout.setContentsMargins(12, 8, 12, 10)
         status_layout.setSpacing(6)
 
         self.status_label = QtWidgets.QLabel(self._status_value, status_frame)
         self.status_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter)
-        status_layout.addWidget(self.status_label)
-
-        self.progressbar = QtWidgets.QProgressBar(status_frame)
-        self.progressbar.setRange(0, 100)
-        self.progressbar.setValue(int(self._progress_value))
-        self.progressbar.setTextVisible(False)
-        status_layout.addWidget(self.progressbar)
+        status_layout.addWidget(self.status_label, 1)
 
         main_layout.addWidget(status_frame)
 
@@ -475,7 +651,6 @@ class PoseViewerUIMixin:
         self.behavior_var = BindingVar(self._behavior_value, self.behavior_label.setText)
         self.frame_var = BindingVar(self._frame_value, self._update_time_label)
         self.speed_var = BindingVar(self._speed_value, self._update_speed_display)
-        self.progress_var = BindingVar(self._progress_value, lambda value: self.progressbar.setValue(int(round(value))))
 
         self._update_file_menu()
         self._update_play_button()
@@ -620,9 +795,6 @@ class PoseViewerUIMixin:
             self.frame_slider.setValue(value)
             self.frame_slider.blockSignals(False)
 
-    def _set_progress(self, value: float) -> None:
-        self.progress_var.set(value)
-
     def _set_speed_value(self, value: float) -> None:
         self.speed_var.set(value)
 
@@ -670,6 +842,353 @@ class PoseViewerUIMixin:
     def _update_canvas_labels(self, *, xlabel: str, ylabel: str, title: str) -> None:
         self.scene.set_axis_labels(xlabel=xlabel, ylabel=ylabel)
         self.scene.set_title(title)
+
+    def _update_tables_tab(self, *, current_path: Path, data: Dict[str, object]) -> None:
+        """Mark analysis and graphs tabs as needing refresh with new data."""
+        # If analysis is currently loading and we're switching files, cancel it
+        if self._analysis_is_loading and self._analysis_loaded_path != current_path:
+            print(f"[UI] File changed during analysis, marking dirty and cancelling")
+            self._analysis_is_loading = False
+            self._set_tab_loading("tables", False, None)
+            self._set_ui_enabled(True)
+            
+            # Cancel any pending analysis work
+            pane = getattr(self, "analysis_pane", None)
+            if pane is not None and hasattr(pane, "_update_future"):
+                future = pane._update_future
+                if future is not None:
+                    try:
+                        future.cancel()
+                    except Exception:
+                        pass
+        
+        # If graphs are currently loading and we're switching files, cancel
+        if self._graphs_is_loading and self._graphs_loaded_path != current_path:
+            print(f"[UI] File changed during graphs rendering, marking dirty and cancelling")
+            self._graphs_is_loading = False
+            self._set_tab_loading("graphs", False, None)
+            self._set_ui_enabled(True)
+        
+        # Update analysis tab data
+        self._tables_current_path = current_path
+        self._tables_current_payload = data
+        
+        # Only mark dirty if this is a different file than what's currently loaded
+        if self._analysis_loaded_path != current_path:
+            self._tables_dirty = True
+        
+        # Update graphs tab data
+        self._graphs_current_path = current_path
+        self._graphs_current_payload = data
+        
+        # Only mark dirty if this is a different file than what's currently loaded
+        if self._graphs_loaded_path != current_path:
+            self._graphs_dirty = True
+        
+        # If analysis tab is visible and data changed, immediately update
+        if getattr(self, "_tables_visible", False) and self._tables_dirty:
+            self._refresh_tables_if_needed()
+        
+        # If graphs tab is visible and data changed, immediately update
+        if getattr(self, "_graphs_visible", False) and self._graphs_dirty:
+            self._refresh_graphs_if_needed()
+
+    def _refresh_tables_if_needed(self) -> None:
+        pane = getattr(self, "analysis_pane", None)
+        if pane is None:
+            return
+        
+        print(f"[UI] _refresh_tables_if_needed called, dirty={self._tables_dirty}, loading={self._analysis_is_loading}")
+        
+        # Don't start new load if already loading
+        if self._analysis_is_loading:
+            print(f"[UI] Already loading, skipping refresh")
+            return
+        
+        # If not dirty, nothing to do
+        if not self._tables_dirty:
+            print(f"[UI] Not dirty, skipping refresh")
+            return
+        
+        # Get stored data from _update_tables_tab
+        current_path = getattr(self, "_tables_current_path", None)
+        current_payload = getattr(self, "_tables_current_payload", None)
+        
+        if not current_payload or not isinstance(current_payload, dict):
+            print(f"[UI] No valid payload, clearing analysis")
+            pane.update_data(None, None)
+            self._tables_dirty = False
+            self._analysis_loaded_path = None
+            return
+        
+        # Check if this data is already in smart cache - if so, no loading overlay needed
+        from .smart_cache import get_cache_manager
+        cache_mgr = get_cache_manager()
+        payloads = current_payload.get("payloads", [])
+        cache_key = cache_mgr.get_cache_key(path=current_path, params={'n_frames': len(payloads)})
+        
+        is_cached = cache_mgr.analysis_cache.get(cache_key) is not None
+        print(f"[UI] Analysis cache check: {'HIT' if is_cached else 'MISS'} for {current_path}")
+        
+        # Only show loading if not cached
+        if not is_cached:
+            print(f"[UI] Showing loading overlay for uncached analysis")
+            self._set_tab_loading("tables", True, "Analyzing data...")
+            self._analysis_is_loading = True
+            self._set_ui_enabled(False)
+        
+        print(f"[UI] Calling pane.update_data with path={current_path}")
+        
+        # Pass the data directly - it already has frames and metadata
+        pane.update_data(current_path, current_payload)
+        
+        # Mark as loaded and clean
+        self._tables_dirty = False
+        self._analysis_loaded_path = current_path
+    
+    def _refresh_graphs_if_needed(self) -> None:
+        pane = getattr(self, "graphs_pane", None)
+        if pane is None:
+            return
+        
+        print(f"[UI] _refresh_graphs_if_needed called, dirty={self._graphs_dirty}, loading={self._graphs_is_loading}")
+        
+        # Don't start new load if already loading
+        if self._graphs_is_loading:
+            print(f"[UI] Already loading graphs, skipping refresh")
+            return
+        
+        # If not dirty, nothing to do
+        if not self._graphs_dirty:
+            print(f"[UI] Graphs not dirty, skipping refresh")
+            return
+        
+        # Get stored data
+        current_path = getattr(self, "_graphs_current_path", None)
+        current_payload = getattr(self, "_graphs_current_payload", None)
+        
+        if not current_payload or not isinstance(current_payload, dict):
+            print(f"[UI] No valid payload for graphs, clearing")
+            pane.update_data(None, None)
+            self._graphs_dirty = False
+            self._graphs_loaded_path = None
+            return
+        
+        # Graphs always need to render (visual output), so always show loading
+        print(f"[UI] Showing loading overlay for graphs rendering")
+        self._set_tab_loading("graphs", True, "Rendering graphs...")
+        self._graphs_is_loading = True
+        self._set_ui_enabled(False)
+        
+        print(f"[UI] Calling graphs_pane.update_data with path={current_path}")
+        
+        # Pass the data directly
+        pane.update_data(current_path, current_payload)
+        
+        # Mark as loaded and clean
+        self._graphs_dirty = False
+        self._graphs_loaded_path = current_path
+
+    def _handle_view_mode_change(self, key: str) -> None:
+        if key == "graphs":
+            self._show_graphs_panel()
+            return
+        if key == "tables":
+            self._show_tables_panel()
+            return
+        self._show_viewer_panel()
+
+    def _show_viewer_panel(self) -> None:
+        # Pause playback when switching to viewer panel
+        self._force_pause_playback()
+        
+        stack = getattr(self, "content_stack", None)
+        viewer = getattr(self, "viewer_container", None)
+        if stack is None or viewer is None:
+            return
+        stack.setCurrentWidget(viewer)
+        self._active_view = "viewer"
+        self._tables_visible = False
+        self._graphs_visible = False
+        title_bar = getattr(self, "title_bar", None)
+        if title_bar is not None:
+            title_bar.set_active_view("viewer")
+    
+    def _show_graphs_panel(self) -> None:
+        # Pause playback when switching to graphs panel
+        self._force_pause_playback()
+        
+        print(f"[UI] _show_graphs_panel called, dirty={getattr(self, '_graphs_dirty', False)}, loaded_path={getattr(self, '_graphs_loaded_path', None)}, current_path={getattr(self, '_graphs_current_path', None)}")
+        
+        stack = getattr(self, "content_stack", None)
+        pane = getattr(self, "graphs_pane", None)
+        if stack is None or pane is None:
+            return
+        
+        # Switch to graphs panel immediately (no loading overlay on viewer)
+        print(f"[UI] Switching to graphs panel")
+        stack.setCurrentWidget(pane)
+        self._active_view = "graphs"
+        self._graphs_visible = True
+        self._tables_visible = False
+        
+        # Update title bar
+        title_bar = getattr(self, "title_bar", None)
+        if title_bar is not None:
+            title_bar.set_active_view("graphs")
+        
+        # Start the refresh if needed (this will handle loading overlay internally)
+        self._refresh_graphs_if_needed()
+
+    def _show_tables_panel(self) -> None:
+        # Pause playback when switching to analysis panel
+        self._force_pause_playback()
+        
+        print(f"[UI] _show_tables_panel called, dirty={getattr(self, '_tables_dirty', False)}, loaded_path={getattr(self, '_analysis_loaded_path', None)}, current_path={getattr(self, '_tables_current_path', None)}")
+        
+        stack = getattr(self, "content_stack", None)
+        pane = getattr(self, "analysis_pane", None)
+        if stack is None or pane is None:
+            return
+        
+        # Switch to tables panel immediately (no loading overlay on viewer)
+        print(f"[UI] Switching to tables panel")
+        stack.setCurrentWidget(pane)
+        self._active_view = "tables"
+        self._tables_visible = True
+        self._graphs_visible = False
+        
+        # Update title bar
+        title_bar = getattr(self, "title_bar", None)
+        if title_bar is not None:
+            title_bar.set_active_view("tables")
+        
+        # Start the refresh if needed (this will handle loading overlay internally)
+        self._refresh_tables_if_needed()
+    
+    def _get_current_tab_name(self) -> str:
+        """Get the name of the currently active tab."""
+        active_view = getattr(self, "_active_view", "viewer")
+        return active_view if active_view in ("viewer", "graphs", "tables") else "viewer"
+
+    def _set_tab_loading(self, tab: str, active: bool, message: Optional[str]) -> None:
+        print(f"[UI] _set_tab_loading tab={tab}, active={active}, message={message}")
+        overlay: Optional[LoadingOverlay] = None
+        if tab == "viewer":
+            overlay = getattr(self, "viewer_overlay", None)
+        elif tab == "graphs":
+            overlay = getattr(self, "graphs_overlay", None)
+        elif tab == "tables":
+            overlay = getattr(self, "tables_overlay", None)
+        if overlay is not None:
+            print(f"[UI] Setting overlay loading state: {active}")
+            overlay.set_loading(active, message)
+        else:
+            print(f"[UI] Warning: No overlay found for tab {tab}")
+    
+    def _on_graphs_complete(self) -> None:
+        """Handle graphs completion signal."""
+        print(f"[UI] Graphs complete signal received, hiding loading overlay")
+        self._graphs_is_loading = False
+        self._set_tab_loading("graphs", False, None)
+        self._set_ui_enabled(True)
+    
+    def _on_analysis_complete(self) -> None:
+        """Handle analysis completion signal."""
+        print(f"[UI] Analysis complete signal received, hiding loading overlay")
+        self._analysis_is_loading = False
+        self._set_tab_loading("tables", False, None)
+        self._set_ui_enabled(True)
+    
+    def _refresh_graphs_if_needed(self) -> None:
+        pane = getattr(self, "graphs_pane", None)
+        if pane is None:
+            return
+        
+        print(f"[UI] _refresh_graphs_if_needed called, dirty={self._graphs_dirty}, loading={self._graphs_is_loading}")
+        
+        # Don't start new load if already loading
+        if self._graphs_is_loading:
+            print(f"[UI] Already loading, skipping refresh")
+            return
+        
+        # If not dirty, nothing to do
+        if not self._graphs_dirty:
+            print(f"[UI] Not dirty, skipping refresh")
+            return
+        
+        # Get stored data
+        current_path = getattr(self, "_graphs_current_path", None)
+        current_payload = getattr(self, "_graphs_current_payload", None)
+        
+        if not current_payload or not isinstance(current_payload, dict):
+            print(f"[UI] No valid payload, clearing graphs")
+            pane.update_data(None, None)
+            self._graphs_dirty = False
+            self._graphs_loaded_path = None
+            return
+        
+        # Graphs are visual - always show loading (no cache check needed)
+        print(f"[UI] Showing loading overlay for graphs")
+        self._set_tab_loading("graphs", True, "Rendering graphs...")
+        self._graphs_is_loading = True
+        self._set_ui_enabled(False)
+        
+        print(f"[UI] Calling graphs_pane.update_data with path={current_path}")
+        
+        # Pass the data directly
+        pane.update_data(current_path, current_payload)
+        
+        # Mark as loaded and clean
+        self._graphs_dirty = False
+        self._graphs_loaded_path = current_path
+
+    def _cancel_tables_future(self) -> None:
+        tables_future = getattr(self, "_tables_future", None)
+        if tables_future is not None:
+            try:
+                tables_future.cancel()
+            except Exception:
+                pass
+    
+    def _set_ui_enabled(self, enabled: bool) -> None:
+        """Enable or disable UI interactions during loading states."""
+        # Disable/enable navigation controls
+        if hasattr(self, "prev_button"):
+            self.prev_button.setEnabled(enabled)
+        if hasattr(self, "next_button"):
+            self.next_button.setEnabled(enabled)
+        if hasattr(self, "file_menu_button"):
+            self.file_menu_button.setEnabled(enabled)
+        
+        # Disable/enable playback controls
+        if hasattr(self, "play_button"):
+            self.play_button.setEnabled(enabled)
+        if hasattr(self, "frame_slider"):
+            self.frame_slider.setEnabled(enabled)
+        if hasattr(self, "speed_slider"):
+            self.speed_slider.setEnabled(enabled)
+        
+        # Keep view toggle always enabled so users can switch away from loading view
+        # But update cursor to show busy state
+        if enabled:
+            self.root.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
+        else:
+            self.root.setCursor(QtCore.Qt.CursorShape.WaitCursor)
+        self._tables_future = None
+
+    def _schedule_tables_payload_compile(self) -> None:
+        """Deprecated - now handled directly by AnalysisPane."""
+        pass
+
+    def _apply_tables_payload(self, generation: int, payload: Dict[str, object]) -> None:
+        """Deprecated - now handled directly by AnalysisPane."""
+        pass
+
+    def _handle_tables_error(self, exc: Exception) -> None:
+        """Deprecated - now handled directly by AnalysisPane."""
+        pass
+
 
     def _scene_begin_frame(
         self,

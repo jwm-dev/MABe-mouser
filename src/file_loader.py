@@ -17,6 +17,7 @@ import pandas as pd
 from .geometry import PoseViewerGeometryMixin
 from .models import FramePayload, MouseGroup
 from .optional_dependencies import cudf, pq
+from .smart_cache import get_cache_manager  # NEW: Smart caching
 
 
 class PoseViewerFileMixin(PoseViewerGeometryMixin):
@@ -24,7 +25,18 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
     _history_store_version = 1
     _history_max_entries = 40
     def _prompt_for_folder(self) -> None:
-        directory = self._ask_directory(title="Select directory with parquet files")
+        # Pause playback immediately before showing the dialog
+        self._force_pause_playback()
+        
+        # Default to MABe dataset directory if it exists
+        default_dir = Path.cwd() / "MABe-mouse-behavior-detection"
+        if not default_dir.exists():
+            default_dir = Path.cwd()
+        
+        directory = self._ask_directory(
+            title="Select directory with parquet files",
+            initialdir=str(default_dir)
+        )
         if not directory:
             return
         folder = Path(directory)
@@ -32,9 +44,20 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
         if not files:
             self._show_warning("No parquet files", f"No parquet files found in {folder}")
             return
+        
+        # Cancel any pending operations before switching folders
+        self._cancel_pending_load()
+        
         self.parquet_files = files
         self.current_file_index = 0
-        self.data_cache.clear()
+        
+        # Clear cache with proper locking
+        with self._get_data_cache_lock():
+            self.data_cache.clear()
+        
+        # Clear cached render metadata from previous folder
+        self._cached_render_metadata = None
+        
         self._update_file_menu()
         self._load_current_file()
 
@@ -396,10 +419,9 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
         if hasattr(self, "title_bar"):
             folder = path.parent.name or str(path.parent)
             self.title_bar.set_subtitle(folder)
-        self._set_status(f"Loading {path.name}…")
-        self.progressbar.setRange(0, 100)
-        self.progress_var.set(0.0)
-        self._queue_progress_update(0.0, f"Loading {path.name}…")
+        message = f"Loading {path.name}…"
+        self._set_status(message)
+        self._queue_progress_update(0.0, message)
         self.mouse_colors.clear()
         self.current_data = None
         self._clear_preserved_camera()
@@ -407,95 +429,287 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
         self._scene_finalize_frame()
         self._redraw_scene()
 
-        if path in self.data_cache:
-            cached_payload = self.data_cache[path]
-            summary_message = self._format_loaded_status(path, cached_payload)
-            self._queue_progress_update(1.0, summary_message)
-            self._on_file_loaded(path, cached_payload)
-            return
+        tab_loader = getattr(self, "_set_tab_loading", None)
+        self._cancel_pending_load()
+        self._load_generation = getattr(self, "_load_generation", 0) + 1
+        generation = self._load_generation
+
+        # NEW: Check smart cache first (multi-layer L1/L2)
+        cache_mgr = get_cache_manager()
+        cache_key = cache_mgr.get_cache_key(path=path)
+        smart_cached = cache_mgr.file_cache.get(cache_key)
+        
+        if smart_cached is not None:
+            print(f"[SmartCache] Using cached file data for {path.name}")
+            try:
+                smart_cached = self._validate_loaded_payload(path=path, data=smart_cached)
+                summary_message = self._format_loaded_status(path, smart_cached)
+                self._queue_progress_update(1.0, summary_message)
+                # Don't show loading overlay or disable UI for instant cached loads
+                self._deliver_loaded_payload(path, smart_cached, summary_message, schedule_cache=False)
+                return
+            except Exception as exc:
+                print(f"[SmartCache] Invalidating bad cache entry: {exc}")
+                cache_mgr.file_cache.invalidate(cache_key)
+
+        # Fallback to old cache system
+        with self._get_data_cache_lock():
+            cached_payload = self.data_cache.get(path)
+        if isinstance(cached_payload, dict):
+            try:
+                cached_payload = self._validate_loaded_payload(path=path, data=cached_payload)
+            except Exception as exc:
+                print(f"[PoseViewer] discarded invalid cached payload for {path.name}: {exc}")
+                with self._get_data_cache_lock():
+                    self.data_cache.pop(path, None)
+            else:
+                summary_message = self._format_loaded_status(path, cached_payload)
+                self._queue_progress_update(1.0, summary_message)
+                # Don't show loading overlay or disable UI for instant cached loads
+                self._deliver_loaded_payload(path, cached_payload, summary_message, schedule_cache=False)
+                return
 
         cached_data = self._load_cached_data(path)
         if cached_data is not None:
-            self.data_cache[path] = cached_data
-            summary_message = self._format_loaded_status(path, cached_data)
-            self._queue_progress_update(1.0, summary_message)
-            self._on_file_loaded(path, cached_data)
-            return
-
-        def worker() -> None:
             try:
-                data = self._prepare_data(
-                    path,
-                    progress_callback=lambda fraction, message: self._queue_progress_update(fraction, message),
-                )
+                cached_data = self._validate_loaded_payload(path=path, data=cached_data)
+            except Exception as exc:
+                print(f"[PoseViewer] cached file invalid for {path.name}: {exc}")
+            else:
+                with self._get_data_cache_lock():
+                    self.data_cache[path] = cached_data
+                summary_message = self._format_loaded_status(path, cached_data)
+                self._queue_progress_update(1.0, summary_message)
+                # Don't show loading overlay or disable UI for instant cached loads
+                self._deliver_loaded_payload(path, cached_data, summary_message, schedule_cache=False)
+                return
+
+        # Only show loading overlay and disable UI if we actually need to load from disk
+        if callable(tab_loader):
+            tab_loader("viewer", True, message)
+        
+        # Disable UI during loading
+        ui_enabler = getattr(self, "_set_ui_enabled", None)
+        if callable(ui_enabler):
+            ui_enabler(False)
+
+        executor = getattr(self, "_io_executor", None)
+
+        def progress_callback(fraction: float, update_message: str) -> None:
+            self._queue_progress_update(fraction, update_message)
+
+        if executor is None or not hasattr(executor, "submit"):
+            try:
+                data = self._prepare_data(path, progress_callback=progress_callback)
+                data = self._validate_loaded_payload(path=path, data=data)
             except Exception as exc:  # pragma: no cover - UI feedback path
                 QtCore.QTimer.singleShot(0, lambda exc=exc: self._handle_load_error(path, exc))
+                if callable(tab_loader):
+                    tab_loader("viewer", False, None)
                 return
-
-            def finalize() -> None:
-                self.data_cache[path] = data
-                self._on_file_loaded(path, data)
-
-            self._invoke_on_main_thread(finalize)
-
             summary_message = self._format_loaded_status(path, data)
-            if not getattr(self, "cache_enabled", True):
-                self._queue_progress_update(1.0, summary_message)
+            self._deliver_loaded_payload(path, data, summary_message, schedule_cache=True)
+            return
+
+        # Use priority executor if available
+        executor_mgr = getattr(self, "_executor_manager", None)
+        if executor_mgr is not None and hasattr(executor_mgr, "submit_load"):
+            future = executor_mgr.submit_load(self._prepare_data, path, progress_callback=progress_callback)
+        else:
+            future = executor.submit(self._prepare_data, path, progress_callback=progress_callback)
+        
+        self._load_future = future
+
+        def _handle_future_result(completed_future) -> None:
+            if completed_future.cancelled() or generation != self._load_generation:
+                # Re-enable UI if load was cancelled
+                ui_enabler = getattr(self, "_set_ui_enabled", None)
+                if callable(ui_enabler):
+                    self._invoke_on_main_thread(lambda: ui_enabler(True))
                 return
+            
+            # Try to get the result; if it raises an exception, handle it
+            try:
+                data = completed_future.result()
+                data = self._validate_loaded_payload(path=path, data=data)
+            except Exception as error:
+                # Error occurred during loading or validation - schedule on main thread
+                print(f"[ERROR] Exception caught in future callback: {type(error).__name__}: {error}", flush=True)
+                self._invoke_on_main_thread(lambda error=error: self._handle_load_error(path, error))
+                if callable(tab_loader):
+                    self._invoke_on_main_thread(lambda: tab_loader("viewer", False, None))
+                return
+            
+            # Success - deliver the payload
+            summary_message = self._format_loaded_status(path, data)
+            self._invoke_on_main_thread(
+                lambda path=path, data=data, summary_message=summary_message: self._deliver_loaded_payload(
+                    path, data, summary_message, schedule_cache=True
+                )
+            )
 
-            cache_message = summary_message
+        future.add_done_callback(_handle_future_result)
 
-            def _toggle_camera_interaction(enabled: bool) -> None:
-                scene = getattr(self, "scene", None)
-                setter = getattr(scene, "set_camera_interaction_enabled", None) if scene is not None else None
-                if callable(setter):
-                    setter(enabled, reason="caching")
+    def _get_data_cache_lock(self) -> threading.RLock:
+        lock = getattr(self, "_data_cache_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            setattr(self, "_data_cache_lock", lock)
+        return lock
 
+    def _cancel_pending_load(self) -> None:
+        future = getattr(self, "_load_future", None)
+        if future is not None:
+            try:
+                future.cancel()
+            except Exception:
+                pass
+        self._load_future = None
+
+    def _deliver_loaded_payload(
+        self,
+        path: Path,
+        data: Dict[str, object],
+        summary_message: str,
+        *,
+        schedule_cache: bool,
+    ) -> None:
+        self._load_future = None
+        tab_loader = getattr(self, "_set_tab_loading", None)
+        ui_enabler = getattr(self, "_set_ui_enabled", None)
+        
+        try:
+            data = self._validate_loaded_payload(path=path, data=data)
+        except Exception as exc:
+            if callable(tab_loader):
+                tab_loader("viewer", False, None)
+            if callable(ui_enabler):
+                ui_enabler(True)
+            self._handle_load_error(path, exc if isinstance(exc, Exception) else Exception(str(exc)))
+            return
+        with self._get_data_cache_lock():
+            self.data_cache[path] = data
+        
+        # NEW: Cache in smart cache system (L1/L2 based on size)
+        cache_mgr = get_cache_manager()
+        cache_key = cache_mgr.get_cache_key(path=path)
+        cache_mgr.file_cache.put(cache_key, data)
+        
+        if callable(tab_loader):
+            tab_loader("viewer", False, None)
+        if callable(ui_enabler):
+            ui_enabler(True)
+            
+        self._on_file_loaded(path, data)
+        
+        # Trigger prefetching of adjacent files
+        prefetch_mgr = getattr(self, "_prefetch_manager", None)
+        if prefetch_mgr is not None:
+            prefetch_mgr.set_current_file(path)
+        
+        if schedule_cache and getattr(self, "cache_enabled", True):
             self._queue_progress_update(0.99, f"Caching {path.name}…")
-            self._invoke_on_main_thread(lambda: _toggle_camera_interaction(False))
+            self._schedule_cache_store(path, data, summary_message)
+        else:
+            self._queue_progress_update(1.0, summary_message)
+
+    def _schedule_cache_store(self, path: Path, data: Dict[str, object], summary_message: str) -> None:
+        executor = getattr(self, "_cache_executor", None)
+        cache_futures = getattr(self, "_cache_futures", set())
+
+        def _toggle_camera_interaction(enabled: bool) -> None:
+            scene = getattr(self, "scene", None)
+            setter = getattr(scene, "set_camera_interaction_enabled", None) if scene is not None else None
+            if callable(setter):
+                setter(enabled, reason="caching")
+
+        self._invoke_on_main_thread(lambda: _toggle_camera_interaction(False))
+
+        if executor is None or not hasattr(executor, "submit"):
+            cache_message = summary_message
             start_time = time.perf_counter()
-            cache_stored = False
             try:
                 self._store_cached_data(path, data)
-                cache_stored = True
             except Exception:
                 cache_message = f"{summary_message} | cache skipped"
-            finally:
+            else:
                 duration = time.perf_counter() - start_time
-                if cache_stored:
-                    print(f"[PoseViewer] cached {path.name} in {duration:.3f}s")
+                print(f"[PoseViewer] cached {path.name} in {duration:.3f}s")
+            finally:
                 self._invoke_on_main_thread(lambda: _toggle_camera_interaction(True))
-
             self._queue_progress_update(1.0, cache_message)
+            return
 
-        def _schedule_initial_load(self) -> None:
-            if not getattr(self, "parquet_files", None):
-                print("[PoseViewer] _schedule_initial_load postponed (no files yet)")
-                return
-            if getattr(self, "_initial_load_scheduled", False):
-                return
-            self._initial_load_scheduled = True
-            def _run_initial_load() -> None:
-                apply_target = getattr(self, "_apply_pending_initial_target", None)
-                applied = bool(callable(apply_target) and apply_target())
-                if applied:
-                    update_menu = getattr(self, "_update_file_menu", None)
-                    if callable(update_menu):
-                        update_menu()
-                self._load_current_file()
-            QtCore.QTimer.singleShot(0, _run_initial_load)
+        def _cache_worker() -> tuple[bool, float]:
+            start_time = time.perf_counter()
+            try:
+                self._store_cached_data(path, data)
+            except Exception:
+                return (False, 0.0)
+            return (True, time.perf_counter() - start_time)
 
-        if self.loading_thread and self.loading_thread.is_alive():
-            self.loading_thread.join(timeout=0.1)
-        self.loading_thread = threading.Thread(target=worker, daemon=True)
-        self.loading_thread.start()
+        future = executor.submit(_cache_worker)
+        cache_futures.add(future)
+
+        def _on_cache_complete(completed_future) -> None:
+            try:
+                success, duration = completed_future.result()
+            except Exception:
+                success = False
+                duration = 0.0
+            cache_futures.discard(completed_future)
+            message = summary_message if success else f"{summary_message} | cache skipped"
+            if success and duration > 0.0:
+                print(f"[PoseViewer] cached {path.name} in {duration:.3f}s")
+            self._invoke_on_main_thread(lambda: _toggle_camera_interaction(True))
+            self._queue_progress_update(1.0, message)
+
+        future.add_done_callback(_on_cache_complete)
+
+    def _snapshot_data_cache(self) -> Dict[Path, Dict[str, object]]:
+        with self._get_data_cache_lock():
+            return dict(self.data_cache)
+
+    def _schedule_initial_load(self) -> None:
+        if not getattr(self, "parquet_files", None):
+            print("[PoseViewer] _schedule_initial_load postponed (no files yet)")
+            return
+        if getattr(self, "_initial_load_scheduled", False):
+            return
+        self._initial_load_scheduled = True
+
+        def _run_initial_load() -> None:
+            apply_target = getattr(self, "_apply_pending_initial_target", None)
+            applied = bool(callable(apply_target) and apply_target())
+            if applied:
+                update_menu = getattr(self, "_update_file_menu", None)
+                if callable(update_menu):
+                    update_menu()
+            self._load_current_file()
+
+        QtCore.QTimer.singleShot(0, _run_initial_load)
 
     def _handle_load_error(self, path: Path, exc: Exception) -> None:
+        print(f"[ERROR] _handle_load_error called: {type(exc).__name__}: {exc}", flush=True)
         self._set_status(f"Failed to load {path.name}: {exc}")
+        self._queue_progress_update(1.0, f"Error: {exc}")  # Hide loading overlay
+        tab_loader = getattr(self, "_set_tab_loading", None)
+        if callable(tab_loader):
+            tab_loader("viewer", False, None)
+        ui_enabler = getattr(self, "_set_ui_enabled", None)
+        if callable(ui_enabler):
+            ui_enabler(True)
+        self._cancel_pending_load()
+        print(f"[ERROR] Showing error dialog...", flush=True)
         self._show_error("Error loading parquet", f"{path}\n\n{exc}")
+        print(f"[ERROR] Error dialog shown", flush=True)
 
     def _on_file_loaded(self, path: Path, data: Dict[str, object]) -> None:
         self.current_data = data
+        
+        # Cache render metadata to avoid recalculating on every frame
+        self._cache_render_metadata(data)
+        
         frame_count = len(data["frames"])  # type: ignore[index]
         self.frame_slider.setMaximum(max(0, frame_count - 1))
         self.frame_var.set(0)
@@ -504,7 +718,6 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
         self.slider_active = False
         self._set_speed_value(self.playback_speed_multiplier)
         self._configure_playback_timeline(path=path, data=data)
-        self.progress_var.set(100.0)
         status_message = self._format_loaded_status(path, data, frame_count=frame_count)
         self._set_status(status_message)
         if data.get("has_behaviors"):
@@ -516,6 +729,199 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
         scene = getattr(self, "scene", None)
         if scene is not None and hasattr(scene, "show_scale_bar_hint"):
             scene.show_scale_bar_hint()
+        
+        # NEW: Preload ALL tabs in parallel for instant tab switching
+        self._preload_all_tabs(path, data)
+        
+        updater = getattr(self, "_update_tables_tab", None)
+        if callable(updater):
+            try:
+                updater(current_path=path, data=data)
+            except Exception as exc:
+                print(f"[PoseViewer] tables update failed: {exc}")
+    
+    def _preload_all_tabs(self, path: Path, data: Dict[str, object]) -> None:
+        """Preload all tab data in parallel for instant tab switching."""
+        print(f"[PoseViewer] Preloading all tabs for {path.name}...")
+        
+        # Get current active tab to show loading overlay there
+        current_tab = getattr(self, "_get_current_tab_name", lambda: "viewer")()
+        tab_loader = getattr(self, "_set_tab_loading", None)
+        
+        # Show loading on active tab
+        if callable(tab_loader):
+            tab_loader(current_tab, True, "Preparing all visualizations...")
+        
+        executor_mgr = getattr(self, "_executor_manager", None)
+        
+        def preload_worker():
+            """Worker function to preload tabs in parallel."""
+            futures = []
+            
+            # Submit tables/analysis preloading
+            tables_future = None
+            if executor_mgr and hasattr(executor_mgr, "submit_analysis"):
+                def preload_tables():
+                    try:
+                        # Trigger tables data preparation
+                        pane = getattr(self, "analysis_pane", None)
+                        if pane and hasattr(pane, "_prepare_data_for_cache"):
+                            pane._prepare_data_for_cache(path, data)
+                        print(f"[Preload] Tables data prepared")
+                        return True
+                    except Exception as e:
+                        print(f"[Preload] Tables preparation failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        return False
+                
+                tables_future = executor_mgr.submit_analysis(preload_tables)
+                futures.append(('tables', tables_future))
+            
+            # Submit graphs preloading
+            graphs_future = None
+            if executor_mgr and hasattr(executor_mgr, "submit_analysis"):
+                def preload_graphs():
+                    try:
+                        # Trigger graphs data preparation
+                        pane = getattr(self, "graphs_pane", None)
+                        if pane and hasattr(pane, "_prepare_data_for_cache"):
+                            pane._prepare_data_for_cache(path, data)
+                        print(f"[Preload] Graphs data prepared")
+                        return True
+                    except Exception as e:
+                        print(f"[Preload] Graphs preparation failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        return False
+                
+                graphs_future = executor_mgr.submit_analysis(preload_graphs)
+                futures.append(('graphs', graphs_future))
+            
+            # Wait for all to complete (with timeout)
+            import concurrent.futures
+            for tab_name, future in futures:
+                if future:
+                    try:
+                        result = future.result(timeout=30.0)  # 30 second timeout
+                        print(f"[Preload] {tab_name} completed: {result}")
+                    except concurrent.futures.TimeoutError:
+                        print(f"[Preload] {tab_name} timed out")
+                    except Exception as e:
+                        print(f"[Preload] {tab_name} error: {e}")
+            
+            # Hide loading overlay on main thread
+            def finish_preload():
+                print(f"[Preload] All tabs preloaded, hiding overlay")
+                if callable(tab_loader):
+                    tab_loader(current_tab, False, None)
+            
+            self._invoke_on_main_thread(finish_preload)
+        
+        # Run preloading in background if executor available
+        if executor_mgr and hasattr(executor_mgr, "submit_load"):
+            executor_mgr.submit_load(preload_worker)
+        else:
+            # Fallback: hide overlay immediately if no executor
+            if callable(tab_loader):
+                tab_loader(current_tab, False, None)
+
+    def _cache_render_metadata(self, data: Dict[str, object]) -> None:
+        """Pre-calculate and cache rendering metadata to avoid per-frame overhead."""
+        metadata_obj = data.get("metadata") if isinstance(data, dict) else None
+        metadata = metadata_obj if isinstance(metadata_obj, dict) else {}
+        
+        # Extract and cache commonly used values
+        cached = {
+            "xlim": tuple(float(v) for v in data.get("xlim", (0.0, 1.0))),
+            "ylim": tuple(float(v) for v in data.get("ylim", (0.0, 1.0))),
+            "aspect": None,
+            "video_size": None,
+            "arena_size_px": None,
+            "arena_size_cm": None,
+            "domain_xlim": (None, None),
+            "domain_ylim": (None, None),
+            "cm_per_pixel": None,
+        }
+        
+        # Aspect ratio
+        aspect_value = data.get("display_aspect_ratio")
+        if isinstance(aspect_value, (int, float)) and math.isfinite(float(aspect_value)) and float(aspect_value) > 0.0:
+            cached["aspect"] = float(aspect_value)
+        
+        # Video size
+        data_video_size = data.get("video_size_px")
+        if isinstance(data_video_size, (tuple, list)) and len(data_video_size) >= 2:
+            try:
+                cached["video_size"] = (float(data_video_size[0]), float(data_video_size[1]))
+            except (TypeError, ValueError):
+                pass
+        
+        if cached["video_size"] is None and metadata:
+            video_dims = self._metadata_video_size_px(metadata)
+            if all(value is not None for value in video_dims):
+                cached["video_size"] = (float(video_dims[0]), float(video_dims[1]))  # type: ignore[index]
+        
+        # Arena size in pixels
+        data_arena_size_px = data.get("arena_size_px")
+        if isinstance(data_arena_size_px, (tuple, list)) and len(data_arena_size_px) >= 2:
+            try:
+                cached["arena_size_px"] = (float(data_arena_size_px[0]), float(data_arena_size_px[1]))
+            except (TypeError, ValueError):
+                pass
+        
+        if cached["arena_size_px"] is None and metadata:
+            arena_dims = self._metadata_arena_size_px(metadata)
+            if all(value is not None for value in arena_dims):
+                cached["arena_size_px"] = (float(arena_dims[0]), float(arena_dims[1]))  # type: ignore[index]
+        
+        # Arena size in cm
+        data_arena_size_cm = data.get("arena_size_cm")
+        if isinstance(data_arena_size_cm, (tuple, list)) and len(data_arena_size_cm) >= 2:
+            try:
+                cached["arena_size_cm"] = (float(data_arena_size_cm[0]), float(data_arena_size_cm[1]))
+            except (TypeError, ValueError):
+                pass
+        
+        if cached["arena_size_cm"] is None and metadata:
+            width_cm = metadata.get("arena_width_cm")
+            height_cm = metadata.get("arena_height_cm")
+            if isinstance(width_cm, (int, float)) and isinstance(height_cm, (int, float)):
+                if math.isfinite(float(width_cm)) and math.isfinite(float(height_cm)):
+                    cached["arena_size_cm"] = (float(width_cm), float(height_cm))
+        
+        # Domain limits
+        raw_domain_xlim = data.get("domain_xlim")
+        raw_domain_ylim = data.get("domain_ylim")
+        if isinstance(raw_domain_xlim, (tuple, list)) and len(raw_domain_xlim) >= 2:
+            cached["domain_xlim"] = (raw_domain_xlim[0], raw_domain_xlim[1])
+        if isinstance(raw_domain_ylim, (tuple, list)) and len(raw_domain_ylim) >= 2:
+            cached["domain_ylim"] = (raw_domain_ylim[0], raw_domain_ylim[1])
+        
+        # Fallback arena size from domain
+        if cached["arena_size_px"] is None:
+            dx_min, dx_max = cached["domain_xlim"]
+            dy_min, dy_max = cached["domain_ylim"]
+            if all(isinstance(val, (int, float)) and math.isfinite(float(val)) for val in (dx_min, dx_max, dy_min, dy_max)):
+                width_val = float(dx_max) - float(dx_min)  # type: ignore[arg-type]
+                height_val = float(dy_max) - float(dy_min)  # type: ignore[arg-type]
+                if width_val > 0.0 and height_val > 0.0:
+                    cached["arena_size_px"] = (width_val, height_val)
+        
+        # cm_per_pixel
+        cm_per_pixel_data = data.get("cm_per_pixel")
+        if isinstance(cm_per_pixel_data, (int, float)) and math.isfinite(float(cm_per_pixel_data)) and float(cm_per_pixel_data) > 0.0:
+            cached["cm_per_pixel"] = float(cm_per_pixel_data)
+        elif metadata:
+            candidate = metadata.get("cm_per_pixel")
+            if isinstance(candidate, (int, float)) and math.isfinite(float(candidate)) and float(candidate) > 0.0:
+                cached["cm_per_pixel"] = float(candidate)
+        
+        if cached["cm_per_pixel"] is None:
+            cached["cm_per_pixel"] = self._resolve_cm_per_pixel(metadata, cached["domain_xlim"], cached["domain_ylim"])
+        
+        self._cached_render_metadata = cached
+
 
     def _format_loaded_status(
         self,
@@ -551,44 +957,94 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
 
         return " | ".join(status_bits)
 
+    def _validate_loaded_payload(self, *, path: Path, data: object) -> Dict[str, object]:
+        if not isinstance(data, dict):
+            raise TypeError(
+                f"Invalid data format in '{path.name}'. "
+                f"Expected pose tracking data but got {type(data).__name__}."
+            )
+        if "frames" not in data:
+            raise ValueError(
+                f"Invalid pose tracking data in '{path.name}'. "
+                f"File does not contain frame data. "
+                f"This viewer requires parquet files with pose tracking coordinates."
+            )
+        frames_obj = data.get("frames")
+        if frames_obj is None:
+            raise ValueError(
+                f"Invalid data in '{path.name}': frame data is empty. "
+                f"This viewer requires parquet files with pose tracking coordinates."
+            )
+        try:
+            frame_count = len(frames_obj)  # type: ignore[arg-type]
+            if frame_count == 0:
+                raise ValueError(
+                    f"No frames found in '{path.name}'. "
+                    f"File appears to be empty or does not contain valid pose tracking data."
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            raise TypeError(
+                f"Invalid frame data structure in '{path.name}'. "
+                f"This viewer requires parquet files with pose tracking coordinates."
+            ) from exc
+        return data
+
     def _prepare_data(
         self,
         path: Path,
         progress_callback: Optional[Callable[[float, str], None]] = None,
     ) -> Dict[str, object]:
-        columns: List[str] = ["video_frame", "mouse_id", "x", "y"]
-        parquet_file = None
-        parquet_backend: Optional[str] = None
-        if pq is not None:
-            try:
-                parquet_file = pq.ParquetFile(path)
-                name = getattr(pq, "__name__", "")
-                parquet_backend = "pyarrow" if name.startswith("pyarrow") else "fastparquet"
-                schema_names = getattr(getattr(parquet_file, "schema", None), "names", None)
-                if schema_names and "bodypart" in schema_names and "bodypart" not in columns:
-                    columns.append("bodypart")
-            except Exception:
-                parquet_file = None
-                parquet_backend = None
+        try:
+            columns: List[str] = ["video_frame", "mouse_id", "x", "y"]
+            parquet_file = None
+            parquet_backend: Optional[str] = None
+            if pq is not None:
+                try:
+                    parquet_file = pq.ParquetFile(path)
+                    name = getattr(pq, "__name__", "")
+                    parquet_backend = "pyarrow" if name.startswith("pyarrow") else "fastparquet"
+                    schema_names = getattr(getattr(parquet_file, "schema", None), "names", None)
+                    if schema_names and "bodypart" in schema_names and "bodypart" not in columns:
+                        columns.append("bodypart")
+                except Exception:
+                    parquet_file = None
+                    parquet_backend = None
 
-        if self.use_gpu and cudf is not None:
-            try:
-                return self._prepare_data_gpu(path, columns, progress_callback)
-            except Exception as exc:
-                if progress_callback:
-                    progress_callback(0.0, f"GPU load failed ({exc}); retrying on CPU…")
+            if self.use_gpu and cudf is not None:
+                try:
+                    return self._prepare_data_gpu(path, columns, progress_callback)
+                except Exception as exc:
+                    if progress_callback:
+                        progress_callback(0.0, f"GPU load failed ({exc}); retrying on CPU…")
 
-        if parquet_file is not None and parquet_backend:
-            try:
-                if parquet_backend == "pyarrow":
-                    return self._prepare_data_pyarrow(path, parquet_file, columns, progress_callback)
-                if parquet_backend == "fastparquet":
-                    return self._prepare_data_fastparquet(path, parquet_file, columns, progress_callback)
-            except Exception as exc:
-                if progress_callback:
-                    progress_callback(0.0, f"{parquet_backend} loader error ({exc}); falling back to pandas…")
+            if parquet_file is not None and parquet_backend:
+                try:
+                    if parquet_backend == "pyarrow":
+                        return self._prepare_data_pyarrow(path, parquet_file, columns, progress_callback)
+                    if parquet_backend == "fastparquet":
+                        return self._prepare_data_fastparquet(path, parquet_file, columns, progress_callback)
+                except Exception as exc:
+                    if progress_callback:
+                        progress_callback(0.0, f"{parquet_backend} loader error ({exc}); falling back to pandas…")
 
-        return self._prepare_data_pandas(path, columns, progress_callback)
+            return self._prepare_data_pandas(path, columns, progress_callback)
+        except Exception as error:
+            # Ensure we provide clear error messages for common issues
+            error_msg = str(error)
+            if "Missing required columns" in error_msg or "does not contain pose tracking data" in error_msg:
+                # Re-raise validation errors as-is (they already have good messages)
+                raise
+            elif not error_msg or error_msg == "":
+                # Generic fallback for empty error messages
+                raise ValueError(
+                    f"Failed to load '{path.name}': Unknown error occurred while reading parquet file. "
+                    f"Please ensure this is a valid pose tracking data file."
+                ) from error
+            else:
+                # Re-raise with additional context
+                raise ValueError(
+                    f"Failed to load '{path.name}': {error_msg}"
+                ) from error
 
     def _prepare_data_gpu(
         self,
@@ -682,8 +1138,6 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
             stats,
             tracking_path=path,
         )
-        if progress_callback:
-            progress_callback(1.0, f"Loaded {path.name}")
         return result
 
     def _prepare_data_fastparquet(
@@ -697,21 +1151,30 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
             progress_callback(0.0, f"Reading {path.name} metadata…")
 
         frame_points_map, frame_labels_map, mouse_ids, stats = self._initialize_accumulators()
-        row_groups = getattr(parquet_file, "row_groups", [])
-        total_rows = sum(getattr(rg, "num_rows", 0) for rg in row_groups) if row_groups else None
+        
+        # Get row group information
+        try:
+            row_groups = parquet_file.info.get('row_groups', [])
+            total_rows = sum(rg.get('num_rows', 0) for rg in row_groups)
+        except Exception:
+            row_groups = []
+            total_rows = None
+        
+        if not row_groups:
+            # Fallback: read entire file if row groups not available
+            if progress_callback:
+                progress_callback(0.0, f"Reading {path.name}…")
+            df = parquet_file.to_pandas(columns=list(dict.fromkeys(columns)))
+            return self._prepare_data_from_dataframe(df, path, progress_callback, start_fraction=0.3)
+        
         processed_rows = 0
+        num_row_groups = len(row_groups)
         start_time = time.time()
 
-        column_list = list(dict.fromkeys(columns))
-        iterator = parquet_file.iter_row_groups(columns=column_list) if hasattr(parquet_file, "iter_row_groups") else []
-
-        for index, chunk in enumerate(iterator):
-            if isinstance(chunk, pd.DataFrame):
-                df_chunk = chunk
-            else:
-                df_chunk = pd.DataFrame(chunk)
+        for group_index, row_group in enumerate(row_groups):
+            chunk = parquet_file.read_row_group(group_index, columns=list(dict.fromkeys(columns)))
             processed_rows += self._accumulate_chunk(
-                df_chunk,
+                chunk,
                 frame_points_map,
                 frame_labels_map,
                 mouse_ids,
@@ -722,29 +1185,17 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
                 if total_rows and total_rows > 0:
                     fraction = min(1.0, processed_rows / total_rows)
                 else:
-                    fraction = (index + 1) / max(1, len(row_groups)) if row_groups else 1.0
+                    fraction = (group_index + 1) / max(1, num_row_groups)
                 message = self._format_progress_message(
                     path.name,
                     processed_rows,
                     total_rows,
                     start_time,
                     fraction,
-                    group_index=index + 1,
-                    group_total=len(row_groups) if row_groups else index + 1,
+                    group_index=group_index + 1,
+                    group_total=num_row_groups,
                 )
                 progress_callback(fraction, message)
-
-        if processed_rows == 0:
-            df_full = parquet_file.to_pandas(columns=column_list)
-            processed_rows = self._accumulate_chunk(
-                df_full,
-                frame_points_map,
-                frame_labels_map,
-                mouse_ids,
-                stats,
-            )
-            if progress_callback:
-                progress_callback(0.4, f"Buffered {processed_rows} rows from {path.name}")
 
         if progress_callback:
             progress_callback(0.95, f"Finalizing {path.name}…")
@@ -756,8 +1207,6 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
             stats,
             tracking_path=path,
         )
-        if progress_callback:
-            progress_callback(1.0, f"Loaded {path.name}")
         return result
 
     def _prepare_data_pandas(
@@ -798,6 +1247,17 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
         filename = path.name
 
         required_columns = ["video_frame", "mouse_id", "x", "y"]
+        
+        # Check if the file has the required columns for pose tracking data
+        missing_columns = set(required_columns) - set(df.columns)
+        if missing_columns:
+            raise ValueError(
+                f"File '{filename}' does not contain pose tracking data. "
+                f"Missing required columns: {', '.join(sorted(missing_columns))}. "
+                f"Found columns: {', '.join(df.columns)}. "
+                "This viewer displays pose tracking data only (files with x, y coordinates for each mouse/frame)."
+            )
+        
         df = df.copy()
         df = df.dropna(subset=required_columns)
         if df.empty:
@@ -852,6 +1312,13 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
             completion_fraction = min(0.95, start_fraction + 0.45)
             progress_callback(completion_fraction, message)
 
+        df = df.reset_index(drop=True)
+        try:
+            if "source_file" not in df.columns:
+                df.insert(0, "source_file", path.name)
+        except Exception:
+            pass
+
         result = self._finalize_payloads(
             frame_points_map,
             frame_labels_map,
@@ -859,6 +1326,8 @@ class PoseViewerFileMixin(PoseViewerGeometryMixin):
             stats,
             tracking_path=path,
         )
+        result["dataframe"] = df
+        result["tracking_path"] = str(path)
         if progress_callback:
             progress_callback(1.0, f"Loaded {filename}")
         return result

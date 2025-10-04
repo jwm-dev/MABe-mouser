@@ -5,8 +5,9 @@ from __future__ import annotations
 import os
 import sys
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import time
 
@@ -14,6 +15,7 @@ import numpy as np
 from PyQt6 import QtCore
 
 from .cache_utils import PoseViewerCacheMixin
+from .dataset_stats import DatasetStatsCache
 from .exporter import PoseViewerExportMixin
 from .file_loader import PoseViewerFileMixin
 from .hover import PoseViewerHoverMixin
@@ -21,6 +23,7 @@ from .optional_dependencies import cudf, imageio, pq
 from .playback import PoseViewerPlaybackMixin
 from .status import PoseViewerStatusMixin
 from .ui import PoseViewerUIMixin
+from .smart_cache import get_cache_manager  # NEW: Smart multi-layer caching
 
 
 class PoseViewerApp(
@@ -91,7 +94,26 @@ class PoseViewerApp(
         self._frame_total_duration = 0.0
 
         self.data_cache: Dict[Path, Dict[str, object]] = {}
+        self._data_cache_lock = threading.RLock()
         self.loading_thread = None
+        
+        # Use smart executor manager with priority queues
+        from .priority_executor import SmartExecutorManager
+        self._executor_manager = SmartExecutorManager()
+        
+        # Legacy executor references for compatibility
+        self._io_executor = self._executor_manager.io_executor
+        self._cache_executor = self._executor_manager.cache_executor
+        
+        # Initialize smart multi-layer caching system
+        self._cache_manager = get_cache_manager()
+        self._log_startup("smart cache manager initialized")
+        
+        self._cache_futures: Set[Future] = set()
+        self._load_future: Optional[Future] = None
+        self._tables_future: Optional[Future] = None
+        self._load_generation: int = 0
+        self._tables_generation: int = 0
 
         self.slider_active: bool = False
         self._initialise_ui_variables()
@@ -113,6 +135,15 @@ class PoseViewerApp(
             self.cache_dir = package_dir
 
         self._log_startup("cache directories prepared")
+        
+        # Initialize dataset statistics cache after cache_dir is set
+        self._dataset_stats = DatasetStatsCache(cache_dir=self.cache_dir)
+        self._init_dataset_stats_async()
+        self._log_startup("dataset statistics initialization started")
+        
+        # Initialize prefetch manager
+        self._init_prefetch_manager()
+        self._log_startup("prefetch manager initialized")
 
         if hasattr(self, "_load_persisted_history"):
             self._load_persisted_history()
@@ -129,6 +160,44 @@ class PoseViewerApp(
         self._post_ui_initialisation()
         self._log_startup("post-ui initialisation complete")
         self._log_startup("PoseViewerApp.__init__ complete")
+    
+    def _init_dataset_stats_async(self) -> None:
+        """Initialize dataset statistics cache asynchronously."""
+        dataset_root = Path("MABe-mouse-behavior-detection")
+        if not dataset_root.exists():
+            print(f"[DatasetStats] Dataset root not found at {dataset_root}")
+            return
+        
+        def worker():
+            self._dataset_stats.load_or_compute(dataset_root, self._io_executor)
+        
+        # Run in background with low priority
+        from .priority_executor import TaskPriority
+        self._cache_executor.submit(worker, priority=TaskPriority.BACKGROUND)
+    
+    def _init_prefetch_manager(self) -> None:
+        """Initialize the prefetch manager for smart file preloading."""
+        from .prefetch import PrefetchManager
+        
+        def prefetch_load_fn(path: Path):
+            """Load function for prefetching."""
+            return self._prepare_data(path)
+        
+        def prefetch_cache_fn(path: Path, data: Dict[str, Any]):
+            """Cache function for prefetching."""
+            with self._get_data_cache_lock():
+                self.data_cache[path] = data
+            self._store_cached_data(path, data)
+        
+        self._prefetch_manager = PrefetchManager(
+            load_fn=prefetch_load_fn,
+            cache_fn=prefetch_cache_fn,
+            executor_submit_fn=lambda fn, **kwargs: self._executor_manager.submit_prefetch(fn, **kwargs)
+        )
+        
+        # Set initial file list
+        if self.parquet_files:
+            self._prefetch_manager.set_file_list(self.parquet_files)
 
     def _log_startup(self, label: str) -> None:
         if getattr(self, "_startup_debug_log_enabled", False):
@@ -136,6 +205,8 @@ class PoseViewerApp(
             print(f"[startup-debug] {label}: {elapsed:.3f}s")
 
     def _post_ui_initialisation(self) -> None:
+        """Post-UI initialization - deferred to avoid blocking window render."""
+        # Check for pending history first
         if not self.parquet_files:
             apply_target = getattr(self, "_apply_pending_initial_target", None)
             if callable(apply_target):
@@ -146,37 +217,40 @@ class PoseViewerApp(
                 else:
                     if applied:
                         self._log_startup("pending history applied")
+        
+        # Defer file loading to ensure window renders first
         if self.parquet_files:
-            if hasattr(self, "_schedule_initial_load"):
-                self._schedule_initial_load()
-            else:
-                self._load_current_file()
+            # Use QTimer.singleShot with small delay to allow window to paint
+            QtCore.QTimer.singleShot(100, self._deferred_initial_load)
         else:
             self._enter_discovery_wait_state("Scanning for parquet files…")
+        
         if self._discovery_root is not None:
             self._begin_parquet_discovery()
         elif not self.parquet_files:
             self._set_status("No parquet files available")
+        
         self._start_background_cache_flush()
+    
+    def _deferred_initial_load(self) -> None:
+        """Load the initial file after window is visible."""
+        if hasattr(self, "_schedule_initial_load"):
+            self._schedule_initial_load()
+        else:
+            self._load_current_file()
 
     def _enter_discovery_wait_state(self, message: str) -> None:
         self._waiting_for_discovery = True
-        try:
-            self.progressbar.setRange(0, 0)
-        except Exception:
-            pass
-        try:
-            self.progress_var.set(0.0)
-        except Exception:
-            pass
         self._set_status(message)
+        tab_loader = getattr(self, "_set_tab_loading", None)
+        if callable(tab_loader):
+            tab_loader("viewer", True, message)
 
     def _exit_discovery_wait_state(self) -> None:
         self._waiting_for_discovery = False
-        try:
-            self.progressbar.setRange(0, 100)
-        except Exception:
-            pass
+        tab_loader = getattr(self, "_set_tab_loading", None)
+        if callable(tab_loader):
+            tab_loader("viewer", False, None)
 
     def _begin_parquet_discovery(self) -> None:
         if self._discovery_root is None:
@@ -304,6 +378,32 @@ class PoseViewerApp(
         if xdg_cache:
             return Path(xdg_cache) / "mabe-pose-viewer"
         return home / ".cache" / "mabe-pose-viewer"
+
+    def _shutdown_background_workers(self) -> None:
+        load_future = getattr(self, "_load_future", None)
+        if load_future is not None:
+            load_future.cancel()
+        self._load_future = None
+
+        tables_future = getattr(self, "_tables_future", None)
+        if tables_future is not None:
+            tables_future.cancel()
+        self._tables_future = None
+
+        cache_futures = getattr(self, "_cache_futures", set())
+        for future in list(cache_futures):
+            future.cancel()
+        cache_futures.clear()
+
+        for attr in ("_io_executor", "_cache_executor"):
+            executor = getattr(self, attr, None)
+            if isinstance(executor, ThreadPoolExecutor):
+                executor.shutdown(wait=False, cancel_futures=True)
+            setattr(self, attr, None)
+
+    def _on_close(self) -> None:  # type: ignore[override]
+        self._shutdown_background_workers()
+        super()._on_close()
 
 
 __all__ = ["PoseViewerApp", "cudf", "imageio", "pq"]
