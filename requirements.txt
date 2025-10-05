@@ -1,31 +1,7 @@
-# Core dependencies for the pose viewer application
-numpy
-pandas
-PyQt6
-vispy
-imageio
-pyarrow
-qtawesome
-kaggle
-scipy
-scikit-learn
-matplotlib
-
-# ============================================================================
-# GPU Acceleration (OPTIONAL - requires CUDA Toolkit installed on system)
-# ============================================================================
-# NOTE: CuPy requires the CUDA Toolkit to be installed on your system first!
-# The application will automatically fall back to NumPy if CuPy is unavailable.
-#
-# To enable GPU acceleration:
-# 1. Install CUDA Toolkit on your system:
-#    - Arch Linux: sudo pacman -S cuda
-#    - Ubuntu: sudo apt install nvidia-cuda-toolkit
-#    - Or download from: https://developer.nvidia.com/cuda-downloads
-#
-# 2. Install CuPy matching your CUDA version:
-#    pip install cupy-cuda11x  # For CUDA 11.x
-#    pip install cupy-cuda12x  # For CUDA 12.x
-#
-# Uncomment the line below ONLY if you have CUDA Toolkit installed:
-# cupy-cuda12x>=12.0.0
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pandas>=2.1.0
+polars>=0.19.0
+pyarrow>=14.0.0
+kaggle>=1.5.16
+python-multipart>=0.0.6

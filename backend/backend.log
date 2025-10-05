@@ -1,0 +1,13 @@
+nohup: ignoring input
+INFO:     Started server process [589588]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+🚀 Starting MABe Viewer API...
+📁 Data directory: /home/jwm/Development/kaggle_comp/MABe-mouse-behavior-detection/train_tracking
+📊 Visit http://localhost:8000/docs for API documentation
+INFO:     127.0.0.1:34134 - "GET /api/files HTTP/1.1" 200 OK
+📊 Loaded 1212811043.parquet: 33141 rows (frames 0-1000)
+🎬 Processing 1000 frames (of 89966 total)...
+✅ Loaded 1212811043.parquet: 1000/89966 frames in 1555.01ms
+INFO:     127.0.0.1:34142 - "GET /api/files/AdaptableSnail/1212811043.parquet HTTP/1.1" 200 OK

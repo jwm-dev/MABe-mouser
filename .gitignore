@@ -2,4 +2,6 @@
 .idea/
 .venv/
 MABe-mouse-behavior-detection/
-src/__pycache__/
+backend/__pycache__/
+frontend/node_modules/
+__pycache__/
