@@ -24,8 +24,7 @@ This will:
 - Install all dependencies (Python + Node.js)
 - Download competition data
 - Start both backend and frontend servers
-
-Opens [http://localhost:3000](http://localhost:3000) when ready.
+- Open [http://localhost:3000](http://localhost:3000) when ready.
 
 ### Kaggle API Setup
 
@@ -85,6 +84,6 @@ npm run dev
 
 ## Troubleshooting
 
-**Port conflicts**: Backend uses port 8000, frontend uses 5173  
+**Port conflicts**: Backend uses port 8000, frontend uses 3000  
 **Kaggle API errors**: Verify `kaggle.json` credentials and permissions  
 **Module not found**: Ensure virtual environment is activated

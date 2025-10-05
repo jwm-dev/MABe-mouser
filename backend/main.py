@@ -9,6 +9,8 @@ import pandas as pd
 from pathlib import Path
 import json
 import time
+import asyncio
+import traceback
 from typing import Optional, Dict, Any
 from functools import lru_cache
 
@@ -23,7 +25,11 @@ app = FastAPI(
 # CORS for local development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",  # Vite default port
+        "http://127.0.0.1:5173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -120,6 +126,8 @@ def get_file_metadata(file_path: str, lab: str = "train_tracking") -> dict:
     # Read only metadata columns for efficiency
     df_meta = pd.read_parquet(path, columns=['video_frame'])
     total_frames = df_meta['video_frame'].nunique()
+    min_frame = int(df_meta['video_frame'].min())
+    max_frame = int(df_meta['video_frame'].max())
     
     # Check if mouse_id exists by reading a sample
     sample_df = pd.read_parquet(path, filters=[('video_frame', '==', df_meta['video_frame'].iloc[0])])
@@ -131,6 +139,8 @@ def get_file_metadata(file_path: str, lab: str = "train_tracking") -> dict:
     
     return {
         "total_frames": int(total_frames),
+        "min_frame": min_frame,
+        "max_frame": max_frame,
         "num_mice": int(num_mice),
         "has_mouse_id": has_mouse_id,
         "fps": video_meta.get('fps', 30.0),
@@ -346,31 +356,47 @@ async def stream_file(
             # Get metadata (cached)
             metadata_dict = get_file_metadata(str(file_path), lab)
             total_frames = metadata_dict.get("total_frames", 0)
+            min_frame = metadata_dict.get("min_frame", 0)
+            max_frame = metadata_dict.get("max_frame", total_frames - 1)
             
-            print(f"📡 Starting stream for {filename}: {total_frames} total frames")
+            print(f"📡 Starting stream for {filename}: {total_frames} frames (range: {min_frame}-{max_frame})")
             
             # Send metadata first
             yield f"data: {json.dumps({'metadata': metadata_dict})}\n\n"
             
+            # Ensure we flush after metadata
+            await asyncio.sleep(0)
+            
             # Stream in chunks using filter pushdown
-            current_frame = start_frame
+            # Start from min_frame, not 0!
+            current_frame = min_frame
             chunks_sent = 0
             
-            while current_frame < total_frames:
+            while current_frame <= max_frame:
                 # Check if client disconnected
                 if await request.is_disconnected():
-                    print(f"🔌 Client disconnected, stopping stream at frame {current_frame}/{total_frames}")
+                    print(f"🔌 Client disconnected, stopping stream at frame {current_frame}/{max_frame}")
                     break
-                end_frame = min(current_frame + chunk_size, total_frames)
+                end_frame = min(current_frame + chunk_size, max_frame + 1)
                 
-                # Read chunk with filter
-                df_chunk = pd.read_parquet(
-                    file_path,
-                    filters=[
-                        ('video_frame', '>=', current_frame),
-                        ('video_frame', '<', end_frame)
+                # Read chunk with filter - use pyarrow engine explicitly
+                try:
+                    df_chunk = pd.read_parquet(
+                        file_path,
+                        engine='pyarrow',
+                        filters=[
+                            ('video_frame', '>=', current_frame),
+                            ('video_frame', '<', end_frame)
+                        ]
+                    )
+                except Exception as filter_error:
+                    # Fallback: read entire file and filter in memory
+                    print(f"⚠️  Filter failed ({filter_error}), reading full file and filtering...")
+                    df_full = pd.read_parquet(file_path)
+                    df_chunk = df_full[
+                        (df_full['video_frame'] >= current_frame) &
+                        (df_full['video_frame'] < end_frame)
                     ]
-                )
                 
                 if len(df_chunk) == 0:
                     print(f"⚠️  No data in chunk {current_frame}-{end_frame}, breaking")
@@ -422,11 +448,11 @@ async def stream_file(
                         })
                 
                 # Send chunk
-                is_complete = end_frame >= total_frames
+                is_complete = current_frame + chunk_size > max_frame
                 chunks_sent += 1
                 
                 if chunks_sent % 10 == 0 or is_complete:
-                    print(f"📦 Sent chunk {chunks_sent}: frames {current_frame}-{end_frame} ({len(chunk_frames)} frames)")
+                    print(f"📦 Sent chunk {chunks_sent}: frames {current_frame}-{end_frame-1} ({len(chunk_frames)} frames)")
                 
                 yield f"data: {json.dumps({'frames': chunk_frames, 'complete': is_complete})}\n\n"
                 
@@ -435,10 +461,20 @@ async def stream_file(
             print(f"✅ Stream complete: sent {chunks_sent} chunks, {current_frame} frames")
                 
         except Exception as e:
+            error_details = traceback.format_exc()
             print(f"❌ Stream error: {e}")
+            print(f"📋 Traceback:\n{error_details}")
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
     
-    return StreamingResponse(generate(), media_type="text/event-stream")
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        }
+    )
 
 
 if __name__ == "__main__":
