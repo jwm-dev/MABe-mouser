@@ -46,6 +46,23 @@ function App() {
     }
   }, [])
   
+  // Track global mouse position for sidebar hover trigger
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      // Auto-show sidebar when mouse is near left edge (within 50px)
+      // But NOT if:
+      // - Currently scrubbing
+      // - Near bottom of screen (timeline/playback controls area - bottom 200px)
+      const isNearBottom = e.clientY > window.innerHeight - 200
+      if (e.clientX < 50 && !sidebarVisible && !isDragging && !isNearBottom) {
+        setSidebarVisible(true)
+      }
+    }
+    
+    window.addEventListener('mousemove', handleMouseMove)
+    return () => window.removeEventListener('mousemove', handleMouseMove)
+  }, [sidebarVisible, isDragging])
+  
   // Use progressive loading hook
   const { 
     frames, 
@@ -198,125 +215,114 @@ function App() {
       // This prevents weird rendering during the transition
       if (rect.height > 20) {
         // Create smooth filmstrip of thumbnails
-        const thumbHeight = rect.height - 6
-      const aspectRatio = 4 / 3 // Approximate aspect ratio for mouse tracking data visualization
-      const thumbWidth = thumbHeight * aspectRatio
-      const loadedWidth = rect.width * loadedProgress
-      const numThumbs = Math.max(1, Math.ceil(loadedWidth / thumbWidth))
-      
-      // Draw subtle background for thumbnail area
-      ctx.fillStyle = 'rgba(15, 15, 25, 0.95)'
-      ctx.fillRect(0, 3, loadedWidth, thumbHeight)
-      
-      // Draw continuous filmstrip across the loaded region
-      for (let i = 0; i < numThumbs; i++) {
-        // Calculate which frame this thumbnail represents
-        // Map thumbnail position to actual loaded frame index
-        const thumbStartX = i * thumbWidth
-        const thumbEndX = Math.min((i + 1) * thumbWidth, loadedWidth)
-        const thumbCenterX = (thumbStartX + thumbEndX) / 2
+        const thumbHeight = rect.height
+        const aspectRatio = 4 / 3 // Approximate aspect ratio for mouse tracking data visualization
+        const thumbWidth = thumbHeight * aspectRatio
+        const loadedWidth = rect.width * loadedProgress
+        const numThumbs = Math.max(1, Math.ceil(loadedWidth / thumbWidth))
         
-        // Get the frame at this position in the LOADED frames
-        const thumbFrameIndex = Math.floor((thumbCenterX / loadedWidth) * currentFrames.length)
-        const clampedIndex = Math.max(0, Math.min(thumbFrameIndex, currentFrames.length - 1))
+        // Draw subtle background for thumbnail area (no inset)
+        ctx.fillStyle = 'rgba(15, 15, 25, 0.95)'
+        ctx.fillRect(0, 0, loadedWidth, thumbHeight)
         
-        const x = thumbStartX
-        const currentThumbWidth = Math.min(thumbWidth, loadedWidth - x)
-        
-        if (currentThumbWidth > 4 && clampedIndex < currentFrames.length) {
-          const frame = currentFrames[clampedIndex]
+        // Draw continuous filmstrip across the loaded region (NO GAPS)
+        for (let i = 0; i < numThumbs; i++) {
+          // Calculate which frame this thumbnail represents
+          // Map thumbnail position to actual loaded frame index
+          const thumbStartX = i * thumbWidth
+          const thumbEndX = Math.min((i + 1) * thumbWidth, loadedWidth)
+          const thumbCenterX = (thumbStartX + thumbEndX) / 2
           
-          // Draw background for thumbnail with slight inset
-          ctx.fillStyle = 'rgba(25, 25, 40, 0.95)'
-          ctx.fillRect(x + 1, 4, currentThumbWidth - 2, thumbHeight - 2)
+          // Get the frame at this position in the LOADED frames
+          const thumbFrameIndex = Math.floor((thumbCenterX / loadedWidth) * currentFrames.length)
+          const clampedIndex = Math.max(0, Math.min(thumbFrameIndex, currentFrames.length - 1))
           
-          // Render simplified visualization of the frame data
-          // Draw a subtle representation based on frame data presence
-          if (frame && frame.mice) {
-            // Collect all points from all mice in this frame
-            const allPoints: number[][] = []
-            Object.values(frame.mice).forEach((mouse: any) => {
-              if (mouse.points && mouse.points.length > 0) {
-                allPoints.push(...mouse.points)
-              }
-            })
+          const x = thumbStartX
+          const currentThumbWidth = Math.min(thumbWidth, loadedWidth - x)
+          
+          if (currentThumbWidth > 2 && clampedIndex < currentFrames.length) {
+            const frame = currentFrames[clampedIndex]
             
-            if (allPoints.length > 0) {
-              // Calculate bounds for this frame's data to create a unique thumbnail
-              let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
-              
-              allPoints.forEach((pt) => {
-                if (pt[0] < minX) minX = pt[0]
-                if (pt[0] > maxX) maxX = pt[0]
-                if (pt[1] < minY) minY = pt[1]
-                if (pt[1] > maxY) maxY = pt[1]
-              })
-              
-              const dataWidth = maxX - minX
-              const dataHeight = maxY - minY
-              const padding = 6
-              const scale = Math.min(
-                (currentThumbWidth - padding * 2) / (dataWidth || 1),
-                (thumbHeight - padding * 2) / (dataHeight || 1)
-              )
-              
-              const offsetX = x + (currentThumbWidth - (dataWidth * scale)) / 2
-              const offsetY = 4 + (thumbHeight - 2 - (dataHeight * scale)) / 2
-              
-              // Draw points as a mini visualization with varying colors
-              const baseHue = (clampedIndex * 137.5) % 360 // Golden angle for color distribution
-              
-              allPoints.slice(0, 30).forEach((pt, idx) => {
-                const px = offsetX + (pt[0] - minX) * scale
-                const py = offsetY + (pt[1] - minY) * scale
-                
-                if (px >= x + 1 && px <= x + currentThumbWidth - 1 && py >= 4 && py <= thumbHeight + 2) {
-                  // Color gradient based on point index
-                  const hue = (baseHue + idx * 10) % 360
-                  ctx.fillStyle = `hsla(${hue}, 70%, 65%, 0.8)`
-                  ctx.beginPath()
-                  ctx.arc(px, py, 1.2, 0, Math.PI * 2)
-                  ctx.fill()
+            // NO background inset - draw edge to edge for smooth filmstrip
+            ctx.fillStyle = 'rgba(25, 25, 40, 0.95)'
+            ctx.fillRect(x, 0, currentThumbWidth, thumbHeight)
+            
+            // Render simplified visualization of the frame data
+            // Draw a subtle representation based on frame data presence
+            if (frame && frame.mice) {
+              // Collect all points from all mice in this frame
+              const allPoints: number[][] = []
+              Object.values(frame.mice).forEach((mouse: any) => {
+                if (mouse.points && mouse.points.length > 0) {
+                  allPoints.push(...mouse.points)
                 }
               })
+              
+              if (allPoints.length > 0) {
+                // Calculate bounds for this frame's data to create a unique thumbnail
+                let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
+                
+                allPoints.forEach((pt) => {
+                  if (pt[0] < minX) minX = pt[0]
+                  if (pt[0] > maxX) maxX = pt[0]
+                  if (pt[1] < minY) minY = pt[1]
+                  if (pt[1] > maxY) maxY = pt[1]
+                })
+                
+                const dataWidth = maxX - minX
+                const dataHeight = maxY - minY
+                const padding = 4  // Reduced padding
+                const scale = Math.min(
+                  (currentThumbWidth - padding * 2) / (dataWidth || 1),
+                  (thumbHeight - padding * 2) / (dataHeight || 1)
+                )
+                
+                const offsetX = x + (currentThumbWidth - (dataWidth * scale)) / 2
+                const offsetY = (thumbHeight - (dataHeight * scale)) / 2
+                
+                // Draw points as a mini visualization with varying colors
+                const baseHue = (clampedIndex * 137.5) % 360 // Golden angle for color distribution
+                
+                allPoints.slice(0, 30).forEach((pt, idx) => {
+                  const px = offsetX + (pt[0] - minX) * scale
+                  const py = offsetY + (pt[1] - minY) * scale
+                  
+                  if (px >= x && px <= x + currentThumbWidth && py >= 0 && py <= thumbHeight) {
+                    // Color gradient based on point index - more vibrant
+                    const hue = (baseHue + idx * 10) % 360
+                    ctx.fillStyle = `hsla(${hue}, 75%, 68%, 0.9)`
+                    ctx.beginPath()
+                    ctx.arc(px, py, 1.5, 0, Math.PI * 2)
+                    ctx.fill()
+                  }
+                })
+              } else {
+                // No points - show smooth gradient
+                const gradient = ctx.createLinearGradient(x, 0, x, thumbHeight)
+                const hue = (clampedIndex * 30) % 360
+                gradient.addColorStop(0, `hsla(${hue}, 55%, 42%, 0.6)`)
+                gradient.addColorStop(1, `hsla(${(hue + 60) % 360}, 55%, 32%, 0.6)`)
+                ctx.fillStyle = gradient
+                ctx.fillRect(x, 0, currentThumbWidth, thumbHeight)
+              }
             } else {
-              // No points - show smooth gradient
-              const gradient = ctx.createLinearGradient(x + 1, 4, x + 1, thumbHeight + 2)
+              // Fallback: smooth gradient pattern
+              const gradient = ctx.createLinearGradient(x, 0, x, thumbHeight)
               const hue = (clampedIndex * 30) % 360
-              gradient.addColorStop(0, `hsla(${hue}, 50%, 40%, 0.5)`)
-              gradient.addColorStop(1, `hsla(${(hue + 60) % 360}, 50%, 30%, 0.5)`)
+              gradient.addColorStop(0, `hsla(${hue}, 55%, 42%, 0.6)`)
+              gradient.addColorStop(1, `hsla(${(hue + 60) % 360}, 55%, 32%, 0.6)`)
               ctx.fillStyle = gradient
-              ctx.fillRect(x + 3, 6, currentThumbWidth - 6, thumbHeight - 6)
+              ctx.fillRect(x, 0, currentThumbWidth, thumbHeight)
             }
-          } else {
-            // Fallback: smooth gradient pattern
-            const gradient = ctx.createLinearGradient(x + 1, 4, x + 1, thumbHeight + 2)
-            const hue = (clampedIndex * 30) % 360
-            gradient.addColorStop(0, `hsla(${hue}, 50%, 40%, 0.5)`)
-            gradient.addColorStop(1, `hsla(${(hue + 60) % 360}, 50%, 30%, 0.5)`)
-            ctx.fillStyle = gradient
-            ctx.fillRect(x + 3, 6, currentThumbWidth - 6, thumbHeight - 6)
-          }
-          
-          // Add subtle separator between thumbnails
-          if (i < numThumbs - 1) {
-            ctx.strokeStyle = 'rgba(255, 255, 255, 0.06)'
-            ctx.lineWidth = 1
-            ctx.beginPath()
-            ctx.moveTo(x + currentThumbWidth, 4)
-            ctx.lineTo(x + currentThumbWidth, thumbHeight + 2)
-            ctx.stroke()
+            
+            // NO separators between thumbnails for smooth filmstrip look
           }
         }
       }
       
-      // Add subtle border around entire filmstrip
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.12)'
-      ctx.lineWidth = 1
-      ctx.strokeRect(0.5, 3.5, loadedWidth - 1, thumbHeight - 1)
+      // NO border around filmstrip for cleaner look
       
       // NO gray loading bar when expanded - thumbnails show the loaded region
-      }
     } else {
       // When collapsed, show clean progress bars only (no thumbnails)
       // Gray loading bar shows buffered/loaded content
@@ -412,12 +418,11 @@ function App() {
       setIsDragging(false)
       setTimelineHovered(false) // Collapse timeline after scrubbing ends
       setTimelineMouseX(null)
-      // Restore cursor - use 'auto' to ensure it's visible
-      document.body.style.cursor = 'auto'
-      // Force a second update to make sure it takes effect
-      setTimeout(() => {
-        document.body.style.cursor = 'auto'
-      }, 0)
+      // Restore cursor completely
+      document.body.style.cursor = ''
+      if (canvasRef.current) {
+        canvasRef.current.style.cursor = 'pointer'
+      }
     }
     
     const handleGlobalMouseMove = (e: MouseEvent) => {
@@ -438,13 +443,16 @@ function App() {
     }
     
     if (isDragging) {
+      // Hide cursor globally when scrubbing starts
+      document.body.style.cursor = 'none'
+      
       window.addEventListener('mouseup', handleGlobalMouseUp)
       window.addEventListener('mousemove', handleGlobalMouseMove)
       return () => {
         window.removeEventListener('mouseup', handleGlobalMouseUp)
         window.removeEventListener('mousemove', handleGlobalMouseMove)
         // Ensure cursor is restored when cleaning up
-        document.body.style.cursor = 'auto'
+        document.body.style.cursor = ''
       }
     }
   }, [isDragging, metadata, frames])
@@ -500,6 +508,13 @@ function App() {
 
   return (
     <>
+      {/* Global cursor hiding during scrubbing */}
+      {isDragging && (
+        <style>{`
+          * { cursor: none !important; }
+        `}</style>
+      )}
+      
       {/* Intro Animation */}
       {showIntro && (
         <div style={{
@@ -1159,17 +1174,18 @@ function App() {
           background: 'linear-gradient(135deg, #0a0a15 0%, #15151f 100%)'
         }}>
           {/* Active Behaviors Panel - positioned absolutely over viewer */}
-          {metadata?.has_annotations && frames && frames.length > 0 && (
+          {metadata?.has_annotations && frames && frames.length > 0 && !sidebarVisible && (
             <div 
               style={{
                 position: 'absolute',
                 top: 0,
-                left: sidebarVisible ? '0' : '90px', // Start after logo when visible
+                left: '90px', // Start after logo
                 right: 0,
                 padding: '16px 20px',
                 zIndex: 100,
                 pointerEvents: 'none',
-                transition: 'left 0.3s cubic-bezier(0.4, 0, 0.2, 1)'
+                transition: 'opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+                opacity: sidebarVisible ? 0 : 1
               }}>
               <div style={{
                 fontSize: '11px',
@@ -1417,40 +1433,25 @@ function App() {
 
         {/* Timeline */}
         {frames && frames.length > 0 && metadata && (
-          <div style={{
-            position: 'absolute',
-            bottom: '64px', // Height of controls only (no separate timer bar now)
-            left: '0',
-            right: '0',
-            zIndex: 10
-          }}
-          onMouseEnter={() => setTimelineHovered(true)}
-          onMouseLeave={() => {
-            // Don't collapse timeline or stop dragging if actively scrubbing
-            if (!isDragging) {
-              setTimelineHovered(false)
-              setTimelineMouseX(null)
-            }
-          }}
-          >
-            <canvas
-              ref={canvasRef}
-              onMouseDown={(e) => {
-                setIsDragging(true)
-                const rect = e.currentTarget.getBoundingClientRect()
-                const x = e.clientX - rect.left
-                const totalFrames = metadata.total_frames || frames.length
-                const frame = Math.floor((x / rect.width) * totalFrames)
-                setCurrentFrame(Math.max(0, Math.min(frame, totalFrames - 1)))
-                
-                // Pause playback when starting to drag
-                if (playing) setPlaying(false)
-              }}
-              onMouseUp={() => {
-                setIsDragging(false)
-              }}
-              onMouseMove={(e) => {
-                const rect = e.currentTarget.getBoundingClientRect()
+          <>
+            {/* Hover detection area - larger than visual timeline for better UX */}
+            <div style={{
+              position: 'absolute',
+              bottom: '64px',
+              left: '0',
+              right: '0',
+              height: '80px', // Larger than expanded timeline (72px) for easier triggering
+              zIndex: 1000,
+              pointerEvents: 'auto',
+              cursor: isDragging ? 'none' : 'pointer'
+            }}
+            onMouseEnter={() => {
+              setTimelineHovered(true)
+            }}
+            onMouseMove={(e) => {
+              // Update mouse position for tracking line
+              if (canvasRef.current) {
+                const rect = canvasRef.current.getBoundingClientRect()
                 const x = e.clientX - rect.left
                 setTimelineMouseX(x)
                 
@@ -1460,7 +1461,41 @@ function App() {
                   const frame = Math.floor((x / rect.width) * totalFrames)
                   setCurrentFrame(Math.max(0, Math.min(frame, totalFrames - 1)))
                 }
-              }}
+              }
+            }}
+            onMouseDown={(e) => {
+              if (canvasRef.current) {
+                setIsDragging(true)
+                const rect = canvasRef.current.getBoundingClientRect()
+                const x = e.clientX - rect.left
+                const totalFrames = metadata.total_frames || frames.length
+                const frame = Math.floor((x / rect.width) * totalFrames)
+                setCurrentFrame(Math.max(0, Math.min(frame, totalFrames - 1)))
+                
+                // Pause playback when starting to drag
+                if (playing) setPlaying(false)
+              }
+            }}
+            onMouseLeave={() => {
+              // Collapse timeline when mouse leaves detection area (unless scrubbing)
+              if (!isDragging) {
+                setTimelineHovered(false)
+                setTimelineMouseX(null)
+              }
+            }}
+            />
+            
+            <div style={{
+              position: 'absolute',
+              bottom: '64px',
+              left: '0',
+              right: '0',
+              zIndex: 10,
+              pointerEvents: 'none' // Don't interfere with hover detection area
+            }}
+            >
+            <canvas
+              ref={canvasRef}
               style={{
                 width: '100%',
                 height: timelineHovered ? '72px' : '8px',
@@ -1470,7 +1505,8 @@ function App() {
                 backdropFilter: 'blur(10px)',
                 transition: 'all 0.25s cubic-bezier(0.4, 0, 0.2, 1)',
                 display: 'block',
-                willChange: 'height'
+                willChange: 'height',
+                pointerEvents: 'none' // Events handled by hover detection area
               }}
             />
             
@@ -1478,7 +1514,9 @@ function App() {
             {timelineHovered && timelineMouseX !== null && metadata && (
               <div style={{
                 position: 'absolute',
-                left: `${timelineMouseX}px`,
+                left: isDragging 
+                  ? `${((currentFrame / (metadata.total_frames || frames.length)) * (canvasRef.current?.getBoundingClientRect().width || 0))}px`
+                  : `${timelineMouseX}px`, // During scrubbing, lock to playback position
                 top: '0',
                 bottom: '0',
                 pointerEvents: 'none',
@@ -1517,17 +1555,18 @@ function App() {
                     if (!canvasRect) return ''
                     
                     const totalFrames = metadata.total_frames || frames.length
-                    const hoverProgress = timelineMouseX / canvasRect.width
-                    const hoverFrame = Math.floor(hoverProgress * totalFrames)
+                    
+                    // During scrubbing, show current frame time; during hover, show hover position
+                    const displayFrame = isDragging ? currentFrame : Math.floor((timelineMouseX / canvasRect.width) * totalFrames)
                     
                     if (metadata.fps) {
-                      const hoverTimeSec = hoverFrame / metadata.fps
-                      const mins = Math.floor(hoverTimeSec / 60)
-                      const secs = Math.floor(hoverTimeSec % 60)
-                      const ms = Math.floor((hoverTimeSec % 1) * 100)
+                      const displayTimeSec = displayFrame / metadata.fps
+                      const mins = Math.floor(displayTimeSec / 60)
+                      const secs = Math.floor(displayTimeSec % 60)
+                      const ms = Math.floor((displayTimeSec % 1) * 100)
                       return `${mins}:${secs.toString().padStart(2, '0')}.${ms.toString().padStart(2, '0')}`
                     } else {
-                      return `Frame ${hoverFrame + 1}`
+                      return `Frame ${displayFrame + 1}`
                     }
                   })()}
                 </div>
@@ -1663,6 +1702,7 @@ function App() {
               </>
             )}
           </div>
+          </>
         )}
 
         {/* Playback Controls */}
@@ -1732,25 +1772,51 @@ function App() {
               textShadow: '0 2px 4px rgba(0, 0, 0, 0.5)',
               userSelect: 'none'
             }}>
-              {hoveredBehavior ? (
-                // Show behavior name when hovering over marker
-                <span style={{
-                  color: (() => {
-                    const behaviorColors: Record<string, string> = {
-                      'attack': '#ef4444',
-                      'investigation': '#f59e0b',
-                      'mount': '#8b5cf6',
-                      'other': '#6b7280'
+              {(() => {
+                // Show behavior name when tracking line intersects a behavior range
+                if ((timelineHovered || isDragging) && metadata?.annotations) {
+                  const validBehaviors = ['chase', 'attack', 'avoid', 'escape', 'mount', 'groom', 'sniff']
+                  const canvasRect = canvasRef.current?.getBoundingClientRect()
+                  if (!canvasRect) return null
+                  
+                  const totalFrames = metadata.total_frames || frames.length
+                  const trackingFrame = isDragging 
+                    ? currentFrame 
+                    : timelineMouseX !== null 
+                      ? Math.floor((timelineMouseX / canvasRect.width) * totalFrames)
+                      : null
+                  
+                  if (trackingFrame !== null) {
+                    const intersectedBehavior = metadata.annotations.find((annotation: any) => {
+                      const actionLower = annotation.action.toLowerCase()
+                      if (!validBehaviors.includes(actionLower)) return false
+                      return trackingFrame >= annotation.start_frame && trackingFrame <= annotation.stop_frame
+                    })
+                    
+                    if (intersectedBehavior) {
+                      const behaviorColors: Record<string, string> = {
+                        'chase': '#ef4444',
+                        'attack': '#ef4444',
+                        'avoid': '#3b82f6',
+                        'escape': '#3b82f6',
+                        'mount': '#a855f7',
+                        'groom': '#10b981',
+                        'sniff': '#fbbf24'
+                      }
+                      const actionLower = intersectedBehavior.action.toLowerCase()
+                      const color = behaviorColors[actionLower] || '#6b7280'
+                      
+                      return (
+                        <span style={{ color, textTransform: 'capitalize' }}>
+                          {intersectedBehavior.action}
+                        </span>
+                      )
                     }
-                    const action = hoveredBehavior.split('-')[0]
-                    return behaviorColors[action.toLowerCase()] || behaviorColors['other']
-                  })()
-                }}>
-                  {hoveredBehavior.split('-')[0]}
-                </span>
-              ) : (
+                  }
+                }
+                
                 // Show time/frame normally
-                metadata && metadata.fps ? (() => {
+                return metadata && metadata.fps ? (() => {
                   const totalFrames = metadata.total_frames || frames.length
                   const currentTimeSec = currentFrame / metadata.fps
                   const totalTimeSec = totalFrames / metadata.fps
@@ -1761,7 +1827,7 @@ function App() {
                   }
                   return `${formatTime(currentTimeSec)} / ${formatTime(totalTimeSec)}`
                 })() : `Frame ${currentFrame + 1}/${(metadata?.total_frames || frames.length)}`
-              )}
+              })()}
             </div>
 
             {/* Frame Navigation Buttons - Right Side */}
