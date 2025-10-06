@@ -337,6 +337,71 @@ async def get_file(
         raise HTTPException(status_code=500, detail=f"Error loading file: {str(e)}")
 
 
+@app.get("/api/files/{lab}/{filename}/frame/{frame_number}")
+async def get_single_frame(
+    lab: str,
+    filename: str,
+    frame_number: int
+):
+    """Fetch a single frame for preview (e.g., timeline hover)"""
+    file_path = DATA_DIR / lab / filename
+    
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
+    
+    try:
+        # Use parquet filter to only read this one frame
+        df = pd.read_parquet(
+            file_path,
+            filters=[('video_frame', '=', frame_number)]
+        )
+        
+        if len(df) == 0:
+            raise HTTPException(status_code=404, detail=f"Frame {frame_number} not found")
+        
+        # Determine structure
+        has_mouse_id = "mouse_id" in df.columns
+        has_bodypart = "bodypart" in df.columns
+        
+        mice = {}
+        
+        if has_mouse_id:
+            for mouse_id, group in df.groupby('mouse_id'):
+                if "z" in group.columns:
+                    points = group[["x", "y", "z"]].values.tolist()
+                else:
+                    points = group[["x", "y"]].values.tolist()
+                
+                labels = group["bodypart"].tolist() if has_bodypart else [f"point_{i}" for i in range(len(points))]
+                
+                mice[str(mouse_id)] = MouseData(
+                    points=points,
+                    labels=labels
+                )
+        else:
+            # Single mouse
+            if "z" in df.columns:
+                points = df[["x", "y", "z"]].values.tolist()
+            else:
+                points = df[["x", "y"]].values.tolist()
+            
+            labels = df["bodypart"].tolist() if has_bodypart else [f"point_{i}" for i in range(len(points))]
+            
+            mice["0"] = MouseData(points=points, labels=labels)
+        
+        frame_data = FrameData(
+            frame_number=frame_number,
+            mice=mice
+        )
+        
+        return frame_data.model_dump()
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching frame: {str(e)}")
+
+
 @app.get("/api/files/{lab}/{filename}/stream")
 async def stream_file(
     request: Request,
@@ -368,9 +433,11 @@ async def stream_file(
             await asyncio.sleep(0)
             
             # Stream in chunks using filter pushdown
-            # Start from min_frame, not 0!
-            current_frame = min_frame
+            # Use start_frame parameter if provided, otherwise start from min_frame
+            current_frame = max(min_frame, start_frame) if start_frame else min_frame
             chunks_sent = 0
+            
+            print(f"🎯 Streaming from frame {current_frame} to {max_frame}")
             
             while current_frame <= max_frame:
                 # Check if client disconnected

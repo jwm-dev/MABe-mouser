@@ -41,6 +41,9 @@ interface ViewerProps {
   onHover?: (info: PickingInfo) => void
   viewState?: any
   onViewStateChange?: (params: { viewState: any }) => void
+  onMouseClick?: (mouseId: string) => void
+  onViewerClick?: () => void
+  trackedMouseId?: string | null
 }
 
 // ============================================================================
@@ -376,10 +379,117 @@ function generateTicks(min: number, max: number, targetCount: number): number[] 
 }
 
 // ============================================================================
+// Smart Label Positioning
+// ============================================================================
+
+interface LabelPosition {
+  mouseId: string
+  position: [number, number, number]
+  text: string
+}
+
+/**
+ * Calculate smart orbital label positions that avoid collisions and viewport edges
+ * Labels orbit around their mice and push away from each other
+ */
+function calculateSmartLabelPositions(
+  mice: Array<{ id: string; centroid: Point2D; text: string }>,
+  viewState: any,
+  metadata: Metadata
+): LabelPosition[] {
+  if (mice.length === 0) return []
+  
+  const labels: LabelPosition[] = []
+  const labelRadius = 60 // Distance from centroid (increased from 30 to 60)
+  const minSeparation = 80 // Minimum pixels between label centers (increased from 60 to 80)
+  
+  // Calculate viewport bounds in scene coordinates
+  const zoom = viewState?.zoom || 0
+  const pixelsPerUnit = Math.pow(2, zoom)
+  const viewportWidth = (window.innerWidth - 280) / pixelsPerUnit
+  const viewportHeight = (window.innerHeight - 64 - 64 - 40) / pixelsPerUnit
+  const targetX = viewState?.target?.[0] || 0
+  const targetY = viewState?.target?.[1] || 0
+  
+  const viewLeft = targetX - viewportWidth / 2
+  const viewRight = targetX + viewportWidth / 2
+  const viewBottom = targetY - viewportHeight / 2
+  const viewTop = targetY + viewportHeight / 2
+  
+  // Video bounds
+  const videoWidth = metadata.video_width || 640
+  const videoHeight = metadata.video_height || 480
+  const videoLeft = -videoWidth / 2
+  const videoRight = videoWidth / 2
+  const videoBottom = -videoHeight / 2
+  const videoTop = videoHeight / 2
+  
+  // Try 8 positions around each mouse (cardinal + diagonal directions)
+  const angles = [0, 45, 90, 135, 180, 225, 270, 315]
+  
+  mice.forEach(mouse => {
+    let bestAngle = 0
+    let bestScore = -Infinity
+    
+    // Try each angle and score it
+    angles.forEach(angleDeg => {
+      const angleRad = (angleDeg * Math.PI) / 180
+      const offsetX = labelRadius * Math.cos(angleRad)
+      const offsetY = labelRadius * Math.sin(angleRad)
+      const labelX = mouse.centroid.x + offsetX
+      const labelY = mouse.centroid.y + offsetY
+      
+      let score = 0
+      
+      // Prefer positions inside viewport
+      const inViewport = labelX >= viewLeft && labelX <= viewRight && 
+                        labelY >= viewBottom && labelY <= viewTop
+      if (inViewport) score += 100
+      
+      // Prefer positions inside video bounds
+      const inVideo = labelX >= videoLeft && labelX <= videoRight &&
+                      labelY >= videoBottom && labelY <= videoTop
+      if (inVideo) score += 50
+      
+      // Avoid other labels (repulsion)
+      labels.forEach(otherLabel => {
+        const dx = labelX - otherLabel.position[0]
+        const dy = labelY - otherLabel.position[1]
+        const dist = Math.sqrt(dx * dx + dy * dy)
+        if (dist < minSeparation) {
+          score -= (minSeparation - dist) * 2 // Penalize overlap
+        }
+      })
+      
+      // Prefer top positions (easier to read)
+      if (angleDeg >= 45 && angleDeg <= 135) score += 10
+      
+      if (score > bestScore) {
+        bestScore = score
+        bestAngle = angleDeg
+      }
+    })
+    
+    // Apply best position
+    const angleRad = (bestAngle * Math.PI) / 180
+    const offsetX = labelRadius * Math.cos(angleRad)
+    const offsetY = labelRadius * Math.sin(angleRad)
+    
+    labels.push({
+      mouseId: mouse.id,
+      position: [mouse.centroid.x + offsetX, mouse.centroid.y + offsetY, 0.2],
+      text: mouse.text
+    })
+  })
+  
+  return labels
+}
+
+// ============================================================================
 // Main Component
 // ============================================================================
 
-export function EnhancedViewer({ frame, metadata, onHover, viewState, onViewStateChange }: ViewerProps) {
+export function EnhancedViewer({ frame, metadata, onHover, viewState, onViewStateChange, onMouseClick, onViewerClick, trackedMouseId }: ViewerProps) {
   const [hoverInfo, setHoverInfo] = useState<PickingInfo | null>(null)
 
   // Custom hover handler that captures the info
@@ -438,15 +548,37 @@ export function EnhancedViewer({ frame, metadata, onHover, viewState, onViewStat
 
     console.log(`📏 Video dimensions: ${videoWidth}x${videoHeight}`)
 
-    // Process each mouse
+    // First pass: collect all mice centroids for smart label positioning
+    const miceData: Array<{ id: string; centroid: Point2D; baseColor: [number, number, number]; data: any; rawPoints: Point2D[]; labels: string[] }> = []
+    
     Object.entries(frame.mice).forEach(([mouseId, mouseData]) => {
       const baseColor = MOUSE_COLORS[mouseId] || [150, 150, 150]
-      
-      // Transform raw pixel coords to centered scene coords
       const rawPoints = toSceneCoords(mouseData.points, videoWidth, videoHeight)
       const labels = mouseData.labels || []
-
+      
       if (rawPoints.length === 0) return
+      
+      const centroid = calculateCentroid(rawPoints)
+      miceData.push({
+        id: mouseId,
+        centroid,
+        baseColor,
+        data: mouseData,
+        rawPoints,
+        labels
+      })
+    })
+    
+    // Calculate smart label positions
+    const smartLabels = calculateSmartLabelPositions(
+      miceData.map(m => ({ id: m.id, centroid: m.centroid, text: `Mouse ${m.id}` })),
+      viewState,
+      metadata
+    )
+
+    // Second pass: render each mouse
+    miceData.forEach((mouse) => {
+      const { id: mouseId, centroid: initialCentroid, baseColor, rawPoints, labels, data: mouseData } = mouse
 
       // Log first point to verify transform
       if (mouseId === '0') {
@@ -456,23 +588,30 @@ export function EnhancedViewer({ frame, metadata, onHover, viewState, onViewStat
 
       // Split body/tail
       const { body, tail } = splitBodyTail(rawPoints, labels)
-      const centroid = body.points.length > 0 ? calculateCentroid(body.points) : calculateCentroid(rawPoints)
+      const centroid = body.points.length > 0 ? calculateCentroid(body.points) : initialCentroid
 
-      // === Convex Hull (transparent filled polygon) ===
+      // === Convex Hull (transparent filled polygon + CLICKABLE) ===
       const hull = convexHull(body.points)
       if (hull && hull.length >= 3) {
         const hullColor = baseColor.map(c => c + (255 - c) * 0.6) as [number, number, number]
+        const isTracked = trackedMouseId === mouseId
+        
         result.push(new PolygonLayer({
           id: `hull-${mouseId}`,
-          data: [{ polygon: hull.map(p => [p.x, p.y, -0.1]) }],
+          data: [{ polygon: hull.map(p => [p.x, p.y, -0.1]), mouseId }],
           getPolygon: (d: any) => d.polygon,
-          getFillColor: [...hullColor, 56] as Color,  // alpha=0.22*255 ≈ 56
-          getLineColor: [0, 0, 0, 0] as Color,
-          getLineWidth: 0,
+          getFillColor: [...hullColor, isTracked ? 80 : 56] as Color,  // brighter when tracked
+          getLineColor: isTracked ? [...baseColor, 255] as Color : [0, 0, 0, 0] as Color,
+          getLineWidth: isTracked ? 3 : 0,
           filled: true,
-          stroked: false,
+          stroked: isTracked,
           coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
-          pickable: false
+          pickable: true,
+          onClick: (info: any) => {
+            if (info.object && onMouseClick) {
+              onMouseClick(info.object.mouseId)
+            }
+          }
         }))
       }
 
@@ -721,20 +860,41 @@ export function EnhancedViewer({ frame, metadata, onHover, viewState, onViewStat
         }))
       })
 
-      // === Mouse Label ===
+      // === Mouse Label (use smart position) ===
       const labelColor = baseColor.map(c => Math.min(255, c + (255 - c) * 0.35)) as [number, number, number]
+      const smartLabel = smartLabels.find(l => l.mouseId === mouseId)
+      const labelPos = smartLabel 
+        ? smartLabel.position
+        : [centroid.x, centroid.y + 20, 0.2]
+      
+      // === Label Connector Line ===
+      if (smartLabel) {
+        result.push(new LineLayer({
+          id: `label-connector-${mouseId}`,
+          data: [{
+            source: [centroid.x, centroid.y, 0.1],
+            target: [labelPos[0], labelPos[1], 0.1]
+          }],
+          getSourcePosition: (d: any) => d.source,
+          getTargetPosition: (d: any) => d.target,
+          getColor: [...labelColor, 120] as Color, // Semi-transparent
+          getWidth: 1.5,
+          coordinateSystem: COORDINATE_SYSTEM.CARTESIAN
+        }))
+      }
+      
       result.push(new TextLayer({
         id: `label-${mouseId}`,
-        data: [{ pos: centroid, text: `Mouse ${mouseId}` }],
-        getPosition: (d: any) => [d.pos.x, d.pos.y + 20, 0.2],
+        data: [{ pos: labelPos, text: `Mouse ${mouseId}` }],
+        getPosition: (d: any) => d.pos,
         getText: (d: any) => d.text,
         getColor: [...labelColor, 255] as Color,
         getSize: 14,
         getAngle: 0,
         getTextAnchor: 'middle',
-        getAlignmentBaseline: 'bottom',
+        getAlignmentBaseline: 'center',
         coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
-        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+        fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
         fontWeight: 600
       }))
     })
@@ -864,7 +1024,7 @@ export function EnhancedViewer({ frame, metadata, onHover, viewState, onViewStat
         getSize: 14,
         getTextAnchor: 'middle',
         getAlignmentBaseline: 'top',
-        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+        fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
         coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
         billboard: true,  // Always face camera (prevents upside-down text)
         pickable: false
@@ -888,11 +1048,11 @@ export function EnhancedViewer({ frame, metadata, onHover, viewState, onViewStat
         }],
         getText: (d: any) => d.text,
         getPosition: (d: any) => d.position,
-        getColor: [...UI_TEXT_PRIMARY, 224] as Color,
+        getColor: [...UI_ACCENT, 224] as Color,  // Match blue arena border color
         getSize: 14,
         getTextAnchor: 'middle',
         getAlignmentBaseline: 'bottom',
-        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+        fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
         coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
         billboard: true,  // Always face camera (prevents upside-down text)
         pickable: false
@@ -961,6 +1121,12 @@ export function EnhancedViewer({ frame, metadata, onHover, viewState, onViewStat
         viewState={viewState}
         onViewStateChange={onViewStateChange}
         onHover={handleHover}
+        onClick={(info: any) => {
+          // If not clicking on an object (clicking background), call onViewerClick
+          if (!info.object && onViewerClick) {
+            onViewerClick()
+          }
+        }}
         controller={true}
         getCursor={() => 'crosshair'}
       />
@@ -983,7 +1149,7 @@ export function EnhancedViewer({ frame, metadata, onHover, viewState, onViewStat
               padding: '8px 12px',
               borderRadius: '4px',
               fontSize: '12px',
-              fontFamily: 'monospace',
+              fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
               boxShadow: '0 2px 8px rgba(0,0,0,0.4)',
               zIndex: 1000,
               whiteSpace: 'nowrap'
@@ -1008,7 +1174,7 @@ export function EnhancedViewer({ frame, metadata, onHover, viewState, onViewStat
             padding: '6px 10px',
             borderRadius: '4px',
             fontSize: '11px',
-            fontFamily: 'monospace',
+            fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
             boxShadow: '0 2px 8px rgba(0,0,0,0.3)',
             zIndex: 1000,
             whiteSpace: 'nowrap'
@@ -1019,36 +1185,81 @@ export function EnhancedViewer({ frame, metadata, onHover, viewState, onViewStat
         )
       })()}
       
-      {/* Scale bar overlay (bottom-right corner, screen coordinates) */}
+      {/* Scale bar overlay (bottom-right corner, above playback controls) */}
       {scaleBarInfo && (
         <div style={{
           position: 'absolute',
-          bottom: '18px',
-          right: '18px',
+          bottom: '84px', // Above 64px playback controls + 20px margin
+          right: '20px',
           pointerEvents: 'none',
           display: 'flex',
           flexDirection: 'column',
           alignItems: 'flex-end',
-          gap: '6px'
+          gap: '8px',
+          transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)' // Smooth animation for size changes
         }}>
+          {/* Scale bar label */}
           <div style={{
-            color: 'rgb(229, 231, 235)',
-            fontSize: '12px',
-            fontFamily: 'monospace',
-            opacity: 0.8,
-            textShadow: '0 0 4px rgba(0,0,0,0.8)'
+            color: 'rgba(229, 231, 235, 0.9)',
+            fontSize: '11px',
+            fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+            fontWeight: '600',
+            letterSpacing: '0.3px',
+            textTransform: 'uppercase',
+            background: 'rgba(20, 20, 35, 0.85)',
+            backdropFilter: 'blur(12px)',
+            padding: '6px 10px',
+            borderRadius: '6px',
+            border: '1px solid rgba(96, 165, 250, 0.3)',
+            boxShadow: '0 4px 12px rgba(0, 0, 0, 0.4)',
+            transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)' // Match parent transition
           }}>
             {scaleBarInfo.label}
           </div>
+          
+          {/* Scale bar visual */}
           <div style={{
-            width: `${scaleBarInfo.widthPx}px`,
-            height: '8px',
-            borderLeft: '1.6px solid rgb(229, 231, 235)',
-            borderRight: '1.6px solid rgb(229, 231, 235)',
-            borderTop: '1.6px solid rgb(229, 231, 235)',
-            opacity: 0.8,
-            filter: 'drop-shadow(0 0 4px rgba(0,0,0,0.8))'
-          }} />
+            position: 'relative',
+            height: '12px',
+            display: 'flex',
+            alignItems: 'center',
+            transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)' // Smooth width changes
+          }}>
+            {/* Main bar */}
+            <div style={{
+              width: `${scaleBarInfo.widthPx}px`,
+              height: '3px',
+              background: 'linear-gradient(90deg, rgba(96, 165, 250, 0.8) 0%, rgba(96, 165, 250, 1) 100%)',
+              borderRadius: '1.5px',
+              boxShadow: '0 0 8px rgba(96, 165, 250, 0.5), 0 2px 4px rgba(0, 0, 0, 0.3)',
+              transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)' // Smooth width changes
+            }} />
+            
+            {/* Left tick */}
+            <div style={{
+              position: 'absolute',
+              left: '0',
+              bottom: '0',
+              width: '2px',
+              height: '12px',
+              background: 'rgba(96, 165, 250, 1)',
+              borderRadius: '1px',
+              boxShadow: '0 0 6px rgba(96, 165, 250, 0.6)'
+            }} />
+            
+            {/* Right tick */}
+            <div style={{
+              position: 'absolute',
+              right: '0',
+              bottom: '0',
+              width: '2px',
+              height: '12px',
+              background: 'rgba(96, 165, 250, 1)',
+              borderRadius: '1px',
+              boxShadow: '0 0 6px rgba(96, 165, 250, 0.6)',
+              transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)' // Position changes with width
+            }} />
+          </div>
         </div>
       )}
     </div>

@@ -1,8 +1,17 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { useProgressiveLoading } from './hooks/useProgressiveLoading'
 import { EnhancedViewer } from './components/EnhancedViewer'
-
+import { useSmartLoading } from './hooks/useSmartLoading'
 import './App.css'
+
+// Mouse colors - must match EnhancedViewer.tsx MOUSE_COLORS
+const MOUSE_COLORS_HEX = [
+  '#ff6464', // Mouse 0: red
+  '#6464ff', // Mouse 1: blue
+  '#64ff64', // Mouse 2: green
+  '#ffff64', // Mouse 3: yellow
+  '#ff64ff', // Mouse 4: magenta
+  '#64ffff', // Mouse 5: cyan
+]
 
 // Types
 interface FileInfo {
@@ -22,10 +31,21 @@ function App() {
   const [timelineMouseX, setTimelineMouseX] = useState<number | null>(null)
   const [isDragging, setIsDragging] = useState(false)
   const [hoveredBehavior, setHoveredBehavior] = useState<string | null>(null)
-  const [forceRedraw, setForceRedraw] = useState(0)
-  const [framesLoaded, setFramesLoaded] = useState(0) // Track when frames finish loading
+  const [previewFrame, setPreviewFrame] = useState<any | null>(null) // Frame data for popup preview
+  const [previewFrameNumber, setPreviewFrameNumber] = useState<number | null>(null) // Track which frame we're previewing
+  const [lastValidFrame, setLastValidFrame] = useState<any | null>(null) // Keep last valid frame to show while loading
   const [sidebarVisible, setSidebarVisible] = useState(false) // Control sidebar visibility
   const [showIntro, setShowIntro] = useState(true) // Control intro animation
+  const [playStateBeforeScrub, setPlayStateBeforeScrub] = useState<boolean | null>(null) // Track play state before scrubbing
+  const [labDropdownOpen, setLabDropdownOpen] = useState(false) // Custom dropdown state
+  const [trackedMouseId, setTrackedMouseId] = useState<string | null>(null) // Track which mouse to follow
+  const lastTrackedPositionRef = useRef<{ x: number; y: number } | null>(null) // Prevent unnecessary viewState updates
+  
+  // Throttle seek calls to prevent spamming backend during rapid scrubbing
+  const lastSeekTimeRef = useRef<number>(0)
+  const pendingSeekRef = useRef<number | null>(null)
+  const seekThrottleMs = 200 // Only allow one seek every 200ms
+  const isSeekingRef = useRef<boolean>(false) // Track if we're currently loading from a seek
   
   // Skip intro on any user interaction
   useEffect(() => {
@@ -63,20 +83,26 @@ function App() {
     return () => window.removeEventListener('mousemove', handleMouseMove)
   }, [sidebarVisible, isDragging])
   
-  // Use progressive loading hook
-  const { 
-    frames, 
-    metadata, 
-    loading, 
+  // Use smart loading hook with on-demand seeking
+  const {
+    frames,
+    getFrame,
+    fetchFrame,
+    metadata,
+    loading,
+    loadedRanges,
     progress, 
-    error
-  } = useProgressiveLoading({
+    error,
+    seekToFrame,
+    isFrameLoaded
+  } = useSmartLoading({
     lab: selectedFile?.lab || '',
     filename: selectedFile?.name || '',
     chunkSize: 100,
+    seekChunkSize: 50,
     onProgress: (loaded, total) => {
       if (loaded % 1000 === 0) {
-        console.log(`📦 Progressive load: ${loaded}/${total} frames (${((loaded/total)*100).toFixed(1)}%)`)
+        console.log(`📦 Smart load: ${loaded}/${total} frames (${((loaded/total)*100).toFixed(1)}%)`)
       }
     }
   })
@@ -113,6 +139,90 @@ function App() {
     console.log(`🚀 Starting progressive load: ${file.name}`)
   }, [])
 
+  // Throttled seek to prevent backend spam during rapid scrubbing
+  const throttledSeek = useCallback((frameNumber: number) => {
+    const now = Date.now()
+    const timeSinceLastSeek = now - lastSeekTimeRef.current
+
+    if (timeSinceLastSeek >= seekThrottleMs) {
+      // Enough time has passed, seek immediately
+      console.log(`🎯 Immediate seek to frame ${frameNumber}`)
+      lastSeekTimeRef.current = now
+      pendingSeekRef.current = null
+      isSeekingRef.current = true
+      seekToFrame(frameNumber)
+    } else {
+      // Too soon, store as pending and it will be executed on drag end
+      console.log(`⏱️ Throttled - storing seek to frame ${frameNumber} as pending`)
+      pendingSeekRef.current = frameNumber
+    }
+  }, [seekToFrame, seekThrottleMs])
+
+  // Execute pending seek when dragging ends
+  useEffect(() => {
+    if (!isDragging && pendingSeekRef.current !== null) {
+      console.log(`🎯 Executing pending seek to frame ${pendingSeekRef.current}`)
+      seekToFrame(pendingSeekRef.current)
+      pendingSeekRef.current = null
+      lastSeekTimeRef.current = Date.now()
+    }
+  }, [isDragging, seekToFrame])
+
+  // Fetch preview frame on hover (YouTube-style: fetch unloaded frames for preview)
+  useEffect(() => {
+    if (!timelineHovered || timelineMouseX === null || !metadata || isDragging) {
+      setPreviewFrame(null)
+      setPreviewFrameNumber(null)
+      return
+    }
+
+    const rect = canvasRef.current?.getBoundingClientRect()
+    if (!rect) return
+
+    const totalFrames = metadata.total_frames || frames.length
+    const hoverFrameNumber = Math.floor((timelineMouseX / rect.width) * totalFrames)
+    
+    // Clamp to valid range
+    const clampedFrameNumber = Math.max(0, Math.min(hoverFrameNumber, totalFrames - 1))
+    
+    // If we're already previewing this frame, don't refetch
+    if (clampedFrameNumber === previewFrameNumber) return
+
+    // Check if frame is already loaded in memory
+    const existingFrame = getFrame(clampedFrameNumber)
+    if (existingFrame) {
+      setPreviewFrame(existingFrame)
+      setPreviewFrameNumber(clampedFrameNumber)
+      return
+    }
+
+    // Frame not loaded - fetch it on demand for preview
+    console.log(`🔍 Fetching preview frame ${clampedFrameNumber}`)
+    setPreviewFrameNumber(clampedFrameNumber)
+    setPreviewFrame(null) // Clear old preview while fetching
+    
+    fetchFrame(clampedFrameNumber)
+      .then(frame => {
+        if (frame) {
+          console.log(`✅ Preview frame ${clampedFrameNumber} loaded`)
+          setPreviewFrame(frame)
+        } else {
+          console.warn(`⚠️ Preview frame ${clampedFrameNumber} returned null`)
+        }
+      })
+      .catch(err => {
+        console.error(`❌ Failed to fetch preview frame ${clampedFrameNumber}:`, err)
+      })
+  }, [timelineHovered, timelineMouseX, metadata, isDragging, frames.length, previewFrameNumber, getFrame, fetchFrame])
+
+  // Keep track of last valid frame to show while seeking/loading
+  useEffect(() => {
+    const currentFrameData = getFrame(currentFrame)
+    if (currentFrameData) {
+      setLastValidFrame(currentFrameData)
+    }
+  }, [currentFrame, getFrame])
+
   // Playback animation (FPS-based timing from metadata)
   useEffect(() => {
     if (!playing || !frames || frames.length === 0 || !metadata) return
@@ -125,16 +235,34 @@ function App() {
 
     const interval = setInterval(() => {
       setCurrentFrame(prev => {
-        if (prev >= frames.length - 1) {
+        const nextFrame = prev + 1
+        // Check if we've reached the end of the video
+        if (nextFrame >= metadata.total_frames) {
           setPlaying(false)
           return prev
         }
-        return prev + 1
+        
+        // If next frame isn't loaded yet, seek to it (but only if not already seeking)
+        if (!isFrameLoaded(nextFrame)) {
+          if (!isSeekingRef.current) {
+            console.log(`⏭️ Next frame ${nextFrame} not loaded, seeking...`)
+            isSeekingRef.current = true
+            seekToFrame(nextFrame)
+          } else {
+            console.log(`⏸️ Waiting for seek to complete before advancing...`)
+            return prev // Stay on current frame while seeking
+          }
+        } else {
+          // Frame is loaded, clear seeking flag
+          isSeekingRef.current = false
+        }
+        
+        return nextFrame
       })
     }, frameInterval)
 
     return () => clearInterval(interval)
-  }, [playing, frames, metadata])
+  }, [playing, frames, metadata, isFrameLoaded, seekToFrame])
 
   // Update browser tab title
   useEffect(() => {
@@ -160,35 +288,161 @@ function App() {
     }
   }, [playing, currentFrame, frames, metadata, selectedFile])
 
-  // Keyboard shortcuts
+  // Keyboard shortcuts - global, work from anywhere on the page
+  // With acceleration for frame navigation when keys are held
   useEffect(() => {
-    const handleKey = (e: KeyboardEvent) => {
+    let currentSpeed = 300 // Start slow (300ms between frames)
+    let accelerationTimer: number | null = null
+    let repeatTimer: number | null = null
+    let isRepeating = false
+    
+    const advanceFrame = (direction: 'next' | 'prev') => {
+      setCurrentFrame(f => {
+        const newFrame = direction === 'next'
+          ? Math.min(metadata!.total_frames - 1, f + 1)
+          : Math.max(0, f - 1)
+        
+        // If frame isn't loaded, seek to it
+        if (!isFrameLoaded(newFrame)) {
+          seekToFrame(newFrame)
+        }
+        return newFrame
+      })
+    }
+    
+    const startRepeating = (direction: 'next' | 'prev') => {
+      if (isRepeating) return
+      
+      isRepeating = true
+      currentSpeed = 300 // Start slow
+      
+      // First advance
+      advanceFrame(direction)
+      
+      // Set up repeating with current speed
+      const repeat = () => {
+        advanceFrame(direction)
+        repeatTimer = window.setTimeout(repeat, currentSpeed)
+      }
+      
+      repeatTimer = window.setTimeout(repeat, currentSpeed)
+      
+      // Gradually accelerate (every 500ms, reduce delay by 30ms, min 50ms)
+      const accelerate = () => {
+        if (currentSpeed > 50) {
+          currentSpeed = Math.max(50, currentSpeed - 30)
+        }
+        accelerationTimer = window.setTimeout(accelerate, 500)
+      }
+      
+      accelerationTimer = window.setTimeout(accelerate, 500)
+    }
+    
+    const stopRepeating = () => {
+      if (!isRepeating) return
+      
+      isRepeating = false
+      if (repeatTimer) {
+        clearTimeout(repeatTimer)
+        repeatTimer = null
+      }
+      if (accelerationTimer) {
+        clearTimeout(accelerationTimer)
+        accelerationTimer = null
+      }
+      currentSpeed = 300
+    }
+    
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (!metadata) return
+      
+      // Skip shortcuts only when typing in text fields/textareas
+      const target = e.target as HTMLElement
+      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') {
+        return
+      }
+      
       // Play/Pause: Space or K (YouTube-style)
       if (e.key === ' ' || e.key === 'k' || e.key === 'K') {
         e.preventDefault()
+        e.stopPropagation()
         setPlaying(p => !p)
       } 
-      // Previous frame: Left Arrow or J (YouTube-style)
+      // Reset camera: R
+      else if (e.key === 'r' || e.key === 'R') {
+        e.preventDefault()
+        e.stopPropagation()
+        setTrackedMouseId(null) // Stop tracking
+        lastTrackedPositionRef.current = null // Reset position tracking
+        // Reset to default view
+        if (metadata) {
+          let width = 640
+          let height = 480
+          
+          if (metadata.video_width && metadata.video_height) {
+            width = metadata.video_width
+            height = metadata.video_height
+          } else if (metadata.arena_width_cm && metadata.arena_height_cm && metadata.pix_per_cm) {
+            width = metadata.arena_width_cm * metadata.pix_per_cm
+            height = metadata.arena_height_cm * metadata.pix_per_cm
+          }
+          
+          const viewportWidth = 1000
+          const viewportHeight = 800
+          const scaleX = viewportWidth / width
+          const scaleY = viewportHeight / height
+          const scale = Math.min(scaleX, scaleY) * 0.9
+          const zoom = Math.log2(scale)
+          
+          setViewState({
+            target: [0, 0, 0],
+            zoom
+          })
+        }
+      }
+      // Previous frame: Left Arrow or J (YouTube-style) - with acceleration on hold
       else if (e.key === 'ArrowLeft' || e.key === 'j' || e.key === 'J') {
         e.preventDefault()
-        setCurrentFrame(f => Math.max(0, f - 1))
+        e.stopPropagation()
+        if (!e.repeat) {
+          // First keypress
+          startRepeating('prev')
+        }
       } 
-      // Next frame: Right Arrow or L (YouTube-style)
+      // Next frame: Right Arrow or L (YouTube-style) - with acceleration on hold
       else if (e.key === 'ArrowRight' || e.key === 'l' || e.key === 'L') {
         e.preventDefault()
-        setCurrentFrame(f => Math.min((frames?.length || 1) - 1, f + 1))
+        e.stopPropagation()
+        if (!e.repeat) {
+          // First keypress
+          startRepeating('next')
+        }
+      }
+    }
+    
+    const handleKeyUp = (e: KeyboardEvent) => {
+      // Stop repeating when key is released
+      if (e.key === 'ArrowLeft' || e.key === 'j' || e.key === 'J' ||
+          e.key === 'ArrowRight' || e.key === 'l' || e.key === 'L') {
+        stopRepeating()
       }
     }
 
-    window.addEventListener('keydown', handleKey)
-    return () => window.removeEventListener('keydown', handleKey)
-  }, [frames])
+    // Use capture phase to intercept before other handlers (like buttons or deck.gl)
+    window.addEventListener('keydown', handleKeyDown, true)
+    window.addEventListener('keyup', handleKeyUp, true)
+    
+    return () => {
+      stopRepeating()
+      window.removeEventListener('keydown', handleKeyDown, true)
+      window.removeEventListener('keyup', handleKeyUp, true)
+    }
+  }, [metadata, isFrameLoaded, seekToFrame])
 
-  // Draw timeline
+  // Draw timeline (YouTube-style: simple bar with continuous buffer indicator)
   useEffect(() => {
     if (!canvasRef.current || !metadata) return
     
-    // Use framesRef.current to get latest frames data (avoid stale closure)
     const currentFrames = framesRef.current
     if (!currentFrames || currentFrames.length === 0) return
 
@@ -200,224 +454,55 @@ function App() {
     ctx.scale(window.devicePixelRatio, window.devicePixelRatio)
 
     // Clear with dark background
-    ctx.fillStyle = 'rgba(15, 15, 30, 0.8)'
+    ctx.fillStyle = 'rgba(15, 15, 30, 0.95)'
     ctx.fillRect(0, 0, rect.width, rect.height)
 
-    // Use metadata.total_frames for accurate progress calculation
-    const totalFrames = metadata.total_frames || currentFrames.length
-    const loadedProgress = currentFrames.length / totalFrames
+    const totalFrames = metadata.total_frames
+
+    // YouTube-style: Draw single continuous loaded buffer (gray bar)
+    // Find the continuous loaded range from the first loaded frame
+    if (loadedRanges.length > 0) {
+      // YouTube loads continuously, so we just show one bar from start to end of first range
+      const loadedRange = loadedRanges[0]
+      const startX = (loadedRange.start / totalFrames) * rect.width
+      const endX = (loadedRange.end / totalFrames) * rect.width
+      
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.3)'
+      ctx.fillRect(startX, 0, endX - startX, rect.height)
+    }
+    
+    // Draw playback progress (purple bar matching UI theme)
     const frameProgress = currentFrame / totalFrames
-    
-    // When expanded (hovered), draw frame preview filmstrip in the loaded region
-    // Use timelineHovered state only - don't check height (it transitions slowly)
-    if (timelineHovered) {
-      // Only draw thumbnails if height is actually expanded enough
-      // This prevents weird rendering during the transition
-      if (rect.height > 20) {
-        // Create smooth filmstrip of thumbnails
-        const thumbHeight = rect.height
-        const aspectRatio = 4 / 3 // Approximate aspect ratio for mouse tracking data visualization
-        const thumbWidth = thumbHeight * aspectRatio
-        const loadedWidth = rect.width * loadedProgress
-        const numThumbs = Math.max(1, Math.ceil(loadedWidth / thumbWidth))
-        
-        // Draw subtle background for thumbnail area (no inset)
-        ctx.fillStyle = 'rgba(15, 15, 25, 0.95)'
-        ctx.fillRect(0, 0, loadedWidth, thumbHeight)
-        
-        // Draw continuous filmstrip across the loaded region (NO GAPS)
-        for (let i = 0; i < numThumbs; i++) {
-          // Calculate which frame this thumbnail represents
-          // Map thumbnail position to actual loaded frame index
-          const thumbStartX = i * thumbWidth
-          const thumbEndX = Math.min((i + 1) * thumbWidth, loadedWidth)
-          const thumbCenterX = (thumbStartX + thumbEndX) / 2
-          
-          // Get the frame at this position in the LOADED frames
-          const thumbFrameIndex = Math.floor((thumbCenterX / loadedWidth) * currentFrames.length)
-          const clampedIndex = Math.max(0, Math.min(thumbFrameIndex, currentFrames.length - 1))
-          
-          const x = thumbStartX
-          const currentThumbWidth = Math.min(thumbWidth, loadedWidth - x)
-          
-          if (currentThumbWidth > 2 && clampedIndex < currentFrames.length) {
-            const frame = currentFrames[clampedIndex]
-            
-            // NO background inset - draw edge to edge for smooth filmstrip
-            ctx.fillStyle = 'rgba(25, 25, 40, 0.95)'
-            ctx.fillRect(x, 0, currentThumbWidth, thumbHeight)
-            
-            // Render simplified visualization of the frame data
-            // Draw a subtle representation based on frame data presence
-            if (frame && frame.mice) {
-              // Collect all points from all mice in this frame
-              const allPoints: number[][] = []
-              Object.values(frame.mice).forEach((mouse: any) => {
-                if (mouse.points && mouse.points.length > 0) {
-                  allPoints.push(...mouse.points)
-                }
-              })
-              
-              if (allPoints.length > 0) {
-                // Calculate bounds for this frame's data to create a unique thumbnail
-                let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
-                
-                allPoints.forEach((pt) => {
-                  if (pt[0] < minX) minX = pt[0]
-                  if (pt[0] > maxX) maxX = pt[0]
-                  if (pt[1] < minY) minY = pt[1]
-                  if (pt[1] > maxY) maxY = pt[1]
-                })
-                
-                const dataWidth = maxX - minX
-                const dataHeight = maxY - minY
-                const padding = 4  // Reduced padding
-                const scale = Math.min(
-                  (currentThumbWidth - padding * 2) / (dataWidth || 1),
-                  (thumbHeight - padding * 2) / (dataHeight || 1)
-                )
-                
-                const offsetX = x + (currentThumbWidth - (dataWidth * scale)) / 2
-                const offsetY = (thumbHeight - (dataHeight * scale)) / 2
-                
-                // Draw points as a mini visualization with varying colors
-                const baseHue = (clampedIndex * 137.5) % 360 // Golden angle for color distribution
-                
-                allPoints.slice(0, 30).forEach((pt, idx) => {
-                  const px = offsetX + (pt[0] - minX) * scale
-                  const py = offsetY + (pt[1] - minY) * scale
-                  
-                  if (px >= x && px <= x + currentThumbWidth && py >= 0 && py <= thumbHeight) {
-                    // Color gradient based on point index - more vibrant
-                    const hue = (baseHue + idx * 10) % 360
-                    ctx.fillStyle = `hsla(${hue}, 75%, 68%, 0.9)`
-                    ctx.beginPath()
-                    ctx.arc(px, py, 1.5, 0, Math.PI * 2)
-                    ctx.fill()
-                  }
-                })
-              } else {
-                // No points - show smooth gradient
-                const gradient = ctx.createLinearGradient(x, 0, x, thumbHeight)
-                const hue = (clampedIndex * 30) % 360
-                gradient.addColorStop(0, `hsla(${hue}, 55%, 42%, 0.6)`)
-                gradient.addColorStop(1, `hsla(${(hue + 60) % 360}, 55%, 32%, 0.6)`)
-                ctx.fillStyle = gradient
-                ctx.fillRect(x, 0, currentThumbWidth, thumbHeight)
-              }
-            } else {
-              // Fallback: smooth gradient pattern
-              const gradient = ctx.createLinearGradient(x, 0, x, thumbHeight)
-              const hue = (clampedIndex * 30) % 360
-              gradient.addColorStop(0, `hsla(${hue}, 55%, 42%, 0.6)`)
-              gradient.addColorStop(1, `hsla(${(hue + 60) % 360}, 55%, 32%, 0.6)`)
-              ctx.fillStyle = gradient
-              ctx.fillRect(x, 0, currentThumbWidth, thumbHeight)
-            }
-            
-            // NO separators between thumbnails for smooth filmstrip look
-          }
-        }
-      }
-      
-      // NO border around filmstrip for cleaner look
-      
-      // NO gray loading bar when expanded - thumbnails show the loaded region
-    } else {
-      // When collapsed, show clean progress bars only (no thumbnails)
-      // Gray loading bar shows buffered/loaded content
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.2)'
-      ctx.fillRect(0, 0, rect.width * loadedProgress, rect.height)
-    }
-    
-    // Draw playback progress with gradient
     const gradient = ctx.createLinearGradient(0, 0, rect.width * frameProgress, 0)
-    if (timelineHovered) {
-      // When expanded, more transparent overlay so thumbnails show through
-      gradient.addColorStop(0, 'rgba(99, 102, 241, 0.35)')
-      gradient.addColorStop(1, 'rgba(139, 92, 246, 0.35)')
-    } else {
-      // When collapsed, solid progress bar
-      gradient.addColorStop(0, 'rgba(99, 102, 241, 0.8)')
-      gradient.addColorStop(1, 'rgba(139, 92, 246, 0.8)')
-    }
+    gradient.addColorStop(0, 'rgba(167, 139, 250, 0.9)')  // Purple theme
+    gradient.addColorStop(1, 'rgba(139, 92, 246, 0.9)')
     ctx.fillStyle = gradient
     ctx.fillRect(0, 0, rect.width * frameProgress, rect.height)
 
-    // Draw current position marker
+    // Draw current position marker (circle)
     const markerX = (currentFrame / totalFrames) * rect.width
-    
-    if (timelineHovered) {
-      // Expanded: vertical line with glow
-      ctx.shadowBlur = 15
-      ctx.shadowColor = 'rgba(167, 139, 250, 0.8)'
-      ctx.strokeStyle = '#a78bfa'
-      ctx.lineWidth = 3
-      ctx.beginPath()
-      ctx.moveTo(markerX, 0)
-      ctx.lineTo(markerX, rect.height)
-      ctx.stroke()
-      ctx.shadowBlur = 0
-    } else {
-      // Collapsed: circular marker (dot)
-      ctx.shadowBlur = 8
-      ctx.shadowColor = 'rgba(167, 139, 250, 0.8)'
-      ctx.fillStyle = '#a78bfa'
-      ctx.beginPath()
-      ctx.arc(markerX, rect.height / 2, 4, 0, Math.PI * 2)
-      ctx.fill()
-      ctx.shadowBlur = 0
-    }
-  }, [currentFrame, frames, frames?.length, metadata, timelineHovered, loading, progress, forceRedraw])
+    ctx.shadowBlur = 8
+    ctx.shadowColor = 'rgba(167, 139, 250, 0.8)'
+    ctx.fillStyle = '#a78bfa'
+    ctx.beginPath()
+    ctx.arc(markerX, rect.height / 2, 6, 0, Math.PI * 2)
+    ctx.fill()
+    ctx.shadowBlur = 0
+  }, [currentFrame, frames, metadata, loadedRanges, getFrame])
 
-  // Force continuous redraws during canvas transition
-  useEffect(() => {
-    if (!timelineHovered || !canvasRef.current) return
-    
-    let animationFrame: number
-    const startTime = Date.now()
-    const transitionDuration = 250 // Match CSS transition duration
-    
-    const animate = () => {
-      const elapsed = Date.now() - startTime
-      if (elapsed < transitionDuration) {
-        setForceRedraw(prev => prev + 1) // Trigger redraw
-        animationFrame = requestAnimationFrame(animate)
-      } else {
-        setForceRedraw(prev => prev + 1) // Final redraw when settled
-      }
-    }
-    
-    animationFrame = requestAnimationFrame(animate)
-    
-    return () => {
-      if (animationFrame) cancelAnimationFrame(animationFrame)
-    }
-  }, [timelineHovered])
-
-  // Track when frames finish loading
-  useEffect(() => {
-    if (!loading && frames && frames.length > 0 && metadata?.total_frames) {
-      // Check if we've loaded all frames
-      if (frames.length >= metadata.total_frames) {
-        setFramesLoaded(prev => prev + 1)
-      }
-    }
-  }, [loading, frames?.length, metadata?.total_frames])
-  
-  // Force redraw when all frames are loaded
-  // Force redraw when all frames are loaded
-  useEffect(() => {
-    if (framesLoaded > 0) {
-      setForceRedraw(prev => prev + 1)
-    }
-  }, [framesLoaded, frames?.length])
   // Handle global mouseup and mousemove for drag scrubbing
   useEffect(() => {
     const handleGlobalMouseUp = () => {
       setIsDragging(false)
       setTimelineHovered(false) // Collapse timeline after scrubbing ends
       setTimelineMouseX(null)
+      
+      // Restore play state after scrubbing
+      if (playStateBeforeScrub !== null) {
+        setPlaying(playStateBeforeScrub)
+        setPlayStateBeforeScrub(null)
+      }
+      
       // Restore cursor completely
       document.body.style.cursor = ''
       if (canvasRef.current) {
@@ -438,7 +523,14 @@ function App() {
         const totalFrames = metadata.total_frames || (frames?.length || 0)
         const clampedX = Math.max(0, Math.min(x, rect.width))
         const frame = Math.floor((clampedX / rect.width) * totalFrames)
-        setCurrentFrame(Math.max(0, Math.min(frame, totalFrames - 1)))
+        const clampedFrame = Math.max(0, Math.min(frame, totalFrames - 1))
+        setCurrentFrame(clampedFrame)
+        
+        // If frame isn't loaded, trigger seek to load it (YouTube-style)
+        if (!isFrameLoaded(clampedFrame)) {
+          console.log(`🎯 Scrubbed to unloaded frame ${clampedFrame}, seeking...`)
+          seekToFrame(clampedFrame)
+        }
       }
     }
     
@@ -455,7 +547,7 @@ function App() {
         document.body.style.cursor = ''
       }
     }
-  }, [isDragging, metadata, frames])
+  }, [isDragging, metadata, frames, isFrameLoaded, seekToFrame, playStateBeforeScrub])
 
   // Initialize camera based on metadata
   const [viewState, setViewState] = useState({
@@ -467,7 +559,8 @@ function App() {
   const activeBehaviors = useCallback(() => {
     if (!metadata?.annotations || !frames || frames.length === 0) return []
     
-    const frameNumber = frames[currentFrame]?.frame_number || 0
+    // currentFrame is now the actual frame number, not an index
+    const frameNumber = currentFrame
     
     return metadata.annotations.filter((annotation: any) => 
       frameNumber >= annotation.start_frame && frameNumber <= annotation.stop_frame
@@ -505,6 +598,52 @@ function App() {
       zoom
     })
   }, [metadata])
+
+  // Track mouse camera follow
+  useEffect(() => {
+    if (!trackedMouseId || !frames || frames.length === 0 || !metadata) return
+    
+    const frame = getFrame(currentFrame)
+    if (!frame || !frame.mice || !frame.mice[trackedMouseId]) return
+    
+    // Calculate mouse centroid
+    const mouseData = frame.mice[trackedMouseId]
+    const videoWidth = metadata.video_width || 640
+    const videoHeight = metadata.video_height || 480
+    
+    // Transform to scene coordinates
+    const centerX = videoWidth / 2
+    const centerY = videoHeight / 2
+    
+    let sumX = 0, sumY = 0, count = 0
+    mouseData.points.forEach(([x, y]: number[]) => {
+      sumX += x - centerX
+      sumY += -(y - centerY)
+      count++
+    })
+    
+    if (count > 0) {
+      const centroidX = sumX / count
+      const centroidY = sumY / count
+      
+      // Only update viewState if position changed significantly (> 2 pixels)
+      const lastPos = lastTrackedPositionRef.current
+      const positionChanged = !lastPos || 
+        Math.abs(centroidX - lastPos.x) > 2 || 
+        Math.abs(centroidY - lastPos.y) > 2
+      
+      if (positionChanged) {
+        lastTrackedPositionRef.current = { x: centroidX, y: centroidY }
+        
+        setViewState(prev => ({
+          ...prev,
+          target: [centroidX, centroidY, 0],
+          // Only set zoom on first track (less aggressive: 2.0x instead of 3.0x)
+          zoom: prev.zoom < 1.5 ? 2.0 : prev.zoom
+        }))
+      }
+    }
+  }, [trackedMouseId, currentFrame, frames, metadata, getFrame])
 
   return (
     <>
@@ -697,9 +836,86 @@ function App() {
                 WebkitBackgroundClip: 'text',
                 WebkitTextFillColor: 'transparent',
                 filter: 'drop-shadow(0 0 20px rgba(102, 126, 234, 0.6))',
-                animation: 'introGlow 3s ease-in-out infinite, fadeOut 0.6s ease-out 1.7s forwards, fadeIn 0.6s ease-out 4.2s forwards'
+                animation: 'introGlow 3s ease-in-out infinite, fadeOut 0.6s ease-out 1.7s forwards, fadeIn 0.6s ease-out 4.2s forwards',
+                userSelect: 'none',
+                WebkitUserSelect: 'none'
               }}>
                 🐱
+                {/* Negative space features on cat */}
+                <span style={{
+                  position: 'absolute',
+                  top: '38%',
+                  left: '32%',
+                  width: '10px',
+                  height: '14px',
+                  background: 'rgba(15, 15, 30, 1)',
+                  borderRadius: '50% 50% 50% 50% / 60% 60% 40% 40%',
+                  transform: 'rotate(-5deg)',
+                  pointerEvents: 'none'
+                }}></span>
+                <span style={{
+                  position: 'absolute',
+                  top: '38%',
+                  right: '32%',
+                  width: '10px',
+                  height: '14px',
+                  background: 'rgba(15, 15, 30, 1)',
+                  borderRadius: '50% 50% 50% 50% / 60% 60% 40% 40%',
+                  transform: 'rotate(5deg)',
+                  pointerEvents: 'none'
+                }}></span>
+                <span style={{
+                  position: 'absolute',
+                  top: '54%',
+                  left: '12%',
+                  width: '26px',
+                  height: '2px',
+                  background: 'rgba(15, 15, 30, 1)',
+                  transform: 'rotate(-12deg)',
+                  pointerEvents: 'none'
+                }}></span>
+                <span style={{
+                  position: 'absolute',
+                  top: '60%',
+                  left: '8%',
+                  width: '30px',
+                  height: '2px',
+                  background: 'rgba(15, 15, 30, 1)',
+                  transform: 'rotate(-4deg)',
+                  pointerEvents: 'none'
+                }}></span>
+                <span style={{
+                  position: 'absolute',
+                  top: '54%',
+                  right: '12%',
+                  width: '26px',
+                  height: '2px',
+                  background: 'rgba(15, 15, 30, 1)',
+                  transform: 'rotate(12deg)',
+                  pointerEvents: 'none'
+                }}></span>
+                <span style={{
+                  position: 'absolute',
+                  top: '60%',
+                  right: '8%',
+                  width: '30px',
+                  height: '2px',
+                  background: 'rgba(15, 15, 30, 1)',
+                  transform: 'rotate(4deg)',
+                  pointerEvents: 'none'
+                }}></span>
+                <span style={{
+                  position: 'absolute',
+                  top: '58%',
+                  left: '50%',
+                  transform: 'translateX(-50%)',
+                  width: '0',
+                  height: '0',
+                  borderLeft: '6px solid transparent',
+                  borderRight: '6px solid transparent',
+                  borderTop: '8px solid rgba(15, 15, 30, 1)',
+                  pointerEvents: 'none'
+                }}></span>
               </span>
               
               {/* Mouse emoji - fades in at middle, fades out */}
@@ -710,20 +926,101 @@ function App() {
                 WebkitTextFillColor: 'transparent',
                 filter: 'drop-shadow(0 0 20px rgba(118, 75, 162, 0.6))',
                 opacity: 0,
-                animation: 'introGlow 3s ease-in-out infinite, fadeIn 0.6s ease-out 2.2s forwards, fadeOut 0.6s ease-out 3.8s forwards'
+                animation: 'introGlow 3s ease-in-out infinite, fadeIn 0.6s ease-out 2.2s forwards, fadeOut 0.6s ease-out 3.8s forwards',
+                userSelect: 'none',
+                WebkitUserSelect: 'none'
               }}>
                 🐭
+                {/* Negative space features on mouse */}
+                <span style={{
+                  position: 'absolute',
+                  top: '42%',
+                  left: '34%',
+                  width: '8px',
+                  height: '8px',
+                  background: 'rgba(15, 15, 30, 1)',
+                  borderRadius: '50%',
+                  pointerEvents: 'none'
+                }}></span>
+                <span style={{
+                  position: 'absolute',
+                  top: '42%',
+                  right: '34%',
+                  width: '8px',
+                  height: '8px',
+                  background: 'rgba(15, 15, 30, 1)',
+                  borderRadius: '50%',
+                  pointerEvents: 'none'
+                }}></span>
+                <span style={{
+                  position: 'absolute',
+                  top: '58%',
+                  left: '14%',
+                  width: '24px',
+                  height: '2px',
+                  background: 'rgba(15, 15, 30, 1)',
+                  transform: 'rotate(-8deg)',
+                  pointerEvents: 'none'
+                }}></span>
+                <span style={{
+                  position: 'absolute',
+                  top: '63%',
+                  left: '12%',
+                  width: '26px',
+                  height: '2px',
+                  background: 'rgba(15, 15, 30, 1)',
+                  transform: 'rotate(-2deg)',
+                  pointerEvents: 'none'
+                }}></span>
+                <span style={{
+                  position: 'absolute',
+                  top: '58%',
+                  right: '14%',
+                  width: '24px',
+                  height: '2px',
+                  background: 'rgba(15, 15, 30, 1)',
+                  transform: 'rotate(8deg)',
+                  pointerEvents: 'none'
+                }}></span>
+                <span style={{
+                  position: 'absolute',
+                  top: '63%',
+                  right: '12%',
+                  width: '26px',
+                  height: '2px',
+                  background: 'rgba(15, 15, 30, 1)',
+                  transform: 'rotate(2deg)',
+                  pointerEvents: 'none'
+                }}></span>
+                <span style={{
+                  position: 'absolute',
+                  top: '62%',
+                  left: '50%',
+                  transform: 'translateX(-50%)',
+                  width: '6px',
+                  height: '6px',
+                  background: 'rgba(15, 15, 30, 1)',
+                  borderRadius: '50% 50% 50% 0',
+                  pointerEvents: 'none'
+                }}></span>
               </span>
             </div>
             
             <div style={{
               fontSize: '48px',
-              fontWeight: '700',
+              fontWeight: '800',
+              fontFamily: "'Poppins', sans-serif",
               background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
               WebkitBackgroundClip: 'text',
               WebkitTextFillColor: 'transparent',
               letterSpacing: '-1px',
-              animation: 'introExpand 1s ease-out 0.3s backwards'
+              animation: 'introExpand 1s ease-out 0.3s backwards',
+              position: 'relative',
+              textShadow: '0 0 40px rgba(102, 126, 234, 0.5), 0 0 80px rgba(118, 75, 162, 0.3)',
+              filter: 'drop-shadow(0 4px 12px rgba(102, 126, 234, 0.4))',
+              WebkitTextStroke: '1px rgba(102, 126, 234, 0.1)',
+              userSelect: 'none',
+              WebkitUserSelect: 'none'
             }}>
               MABe Mouser
             </div>
@@ -757,7 +1054,7 @@ function App() {
         height: '100vh', 
         width: '100vw',
         background: 'rgba(15, 15, 30, 1)', // Match viewer background - solid dark color
-        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
+        fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
         position: 'relative',
         overflow: 'hidden'
       }}>
@@ -781,18 +1078,113 @@ function App() {
       }}>
         <h1 style={{ 
           fontSize: '26px', 
-          fontWeight: '700', 
+          fontWeight: '800', 
+          fontFamily: "'Poppins', sans-serif",
           marginBottom: '24px',
-          background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
-          WebkitBackgroundClip: 'text',
-          WebkitTextFillColor: 'transparent',
           letterSpacing: '-0.5px',
           display: 'flex',
           alignItems: 'center',
-          gap: '10px'
+          gap: '10px',
+          userSelect: 'none',
+          WebkitUserSelect: 'none'
         }}>
-          <span style={{ fontSize: '28px' }}>🐱</span>
-          <span>MABe Mouser</span>
+          {/* Cat emoji with negative space features */}
+          <span style={{
+            position: 'relative',
+            fontSize: '28px',
+            background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+            WebkitBackgroundClip: 'text',
+            WebkitTextFillColor: 'transparent',
+            filter: 'drop-shadow(0 0 10px rgba(102, 126, 234, 0.4))',
+            userSelect: 'none',
+            WebkitUserSelect: 'none'
+          }}>
+            🐱
+            {/* Negative space features */}
+            <span style={{
+              position: 'absolute',
+              top: '38%',
+              left: '32%',
+              width: '3px',
+              height: '4px',
+              background: 'rgba(20, 20, 35, 1)',
+              borderRadius: '50% 50% 50% 50% / 60% 60% 40% 40%',
+              transform: 'rotate(-5deg)',
+              pointerEvents: 'none'
+            }}></span>
+            <span style={{
+              position: 'absolute',
+              top: '38%',
+              right: '32%',
+              width: '3px',
+              height: '4px',
+              background: 'rgba(20, 20, 35, 1)',
+              borderRadius: '50% 50% 50% 50% / 60% 60% 40% 40%',
+              transform: 'rotate(5deg)',
+              pointerEvents: 'none'
+            }}></span>
+            <span style={{
+              position: 'absolute',
+              top: '54%',
+              left: '12%',
+              width: '7px',
+              height: '1px',
+              background: 'rgba(20, 20, 35, 1)',
+              transform: 'rotate(-12deg)',
+              pointerEvents: 'none'
+            }}></span>
+            <span style={{
+              position: 'absolute',
+              top: '60%',
+              left: '8%',
+              width: '8px',
+              height: '1px',
+              background: 'rgba(20, 20, 35, 1)',
+              transform: 'rotate(-4deg)',
+              pointerEvents: 'none'
+            }}></span>
+            <span style={{
+              position: 'absolute',
+              top: '54%',
+              right: '12%',
+              width: '7px',
+              height: '1px',
+              background: 'rgba(20, 20, 35, 1)',
+              transform: 'rotate(12deg)',
+              pointerEvents: 'none'
+            }}></span>
+            <span style={{
+              position: 'absolute',
+              top: '60%',
+              right: '8%',
+              width: '8px',
+              height: '1px',
+              background: 'rgba(20, 20, 35, 1)',
+              transform: 'rotate(4deg)',
+              pointerEvents: 'none'
+            }}></span>
+            <span style={{
+              position: 'absolute',
+              top: '58%',
+              left: '50%',
+              transform: 'translateX(-50%)',
+              width: '0',
+              height: '0',
+              borderLeft: '2px solid transparent',
+              borderRight: '2px solid transparent',
+              borderTop: '2.5px solid rgba(20, 20, 35, 1)',
+              pointerEvents: 'none'
+            }}></span>
+          </span>
+          
+          <span style={{
+            background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+            WebkitBackgroundClip: 'text',
+            WebkitTextFillColor: 'transparent',
+            textShadow: '0 0 30px rgba(102, 126, 234, 0.4), 0 0 60px rgba(118, 75, 162, 0.2)',
+            filter: 'drop-shadow(0 2px 8px rgba(102, 126, 234, 0.3))',
+            WebkitTextStroke: '0.5px rgba(102, 126, 234, 0.15)'
+          }}>MABe Mouser</span>
         </h1>
         
         {selectedFile && (
@@ -889,37 +1281,124 @@ function App() {
           Lab
         </h2>
         
-        <select
-          value={selectedLab}
-          onChange={(e) => setSelectedLab(e.target.value)}
-          style={{
-            width: '100%',
-            padding: '10px 12px',
-            marginBottom: '20px',
-            borderRadius: '8px',
-            border: '1px solid rgba(167, 139, 250, 0.3)',
-            background: 'linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%)',
-            backdropFilter: 'blur(12px)',
-            color: '#e5e7eb',
-            fontSize: '14px',
-            cursor: 'pointer',
-            transition: 'all 0.2s ease',
-            boxShadow: '0 2px 8px rgba(0, 0, 0, 0.2)'
-          }}
-          onMouseEnter={(e) => {
-            e.currentTarget.style.background = 'linear-gradient(135deg, rgba(102, 126, 234, 0.15) 0%, rgba(118, 75, 162, 0.15) 100%)'
-            e.currentTarget.style.borderColor = 'rgba(167, 139, 250, 0.5)'
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.background = 'linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%)'
-            e.currentTarget.style.borderColor = 'rgba(167, 139, 250, 0.3)'
-          }}
-        >
-          <option value="" style={{ background: 'rgba(20, 20, 35, 0.95)', color: '#e5e7eb' }}>Select a lab...</option>
-          {Object.keys(labFiles).sort().map(lab => (
-            <option key={lab} value={lab} style={{ background: 'rgba(20, 20, 35, 0.95)', color: '#e5e7eb' }}>{lab}</option>
-          ))}
-        </select>
+        {/* Custom Dropdown for Lab Selection */}
+        <div style={{ position: 'relative', marginBottom: '20px' }}>
+          {/* Dropdown Button */}
+          <button
+            onClick={() => setLabDropdownOpen(!labDropdownOpen)}
+            onBlur={() => setTimeout(() => setLabDropdownOpen(false), 150)}
+            style={{
+              width: '100%',
+              padding: '12px 14px',
+              borderRadius: '10px',
+              border: '1px solid rgba(167, 139, 250, 0.4)',
+              background: 'linear-gradient(135deg, rgba(102, 126, 234, 0.15) 0%, rgba(118, 75, 162, 0.15) 100%)',
+              backdropFilter: 'blur(12px)',
+              color: selectedLab ? '#f3f4f6' : 'rgba(243, 244, 246, 0.5)',
+              fontSize: '14px',
+              fontWeight: '500',
+              cursor: 'pointer',
+              transition: 'all 0.2s cubic-bezier(0.4, 0, 0.2, 1)',
+              boxShadow: labDropdownOpen 
+                ? '0 0 0 3px rgba(167, 139, 250, 0.2), 0 4px 16px rgba(102, 126, 234, 0.3)'
+                : '0 2px 12px rgba(0, 0, 0, 0.3)',
+              outline: 'none',
+              textAlign: 'left',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between'
+            }}
+            onMouseEnter={(e) => {
+              if (!labDropdownOpen) {
+                e.currentTarget.style.background = 'linear-gradient(135deg, rgba(102, 126, 234, 0.25) 0%, rgba(118, 75, 162, 0.25) 100%)'
+                e.currentTarget.style.borderColor = 'rgba(167, 139, 250, 0.6)'
+                e.currentTarget.style.boxShadow = '0 4px 16px rgba(102, 126, 234, 0.3)'
+              }
+            }}
+            onMouseLeave={(e) => {
+              if (!labDropdownOpen) {
+                e.currentTarget.style.background = 'linear-gradient(135deg, rgba(102, 126, 234, 0.15) 0%, rgba(118, 75, 162, 0.15) 100%)'
+                e.currentTarget.style.borderColor = 'rgba(167, 139, 250, 0.4)'
+                e.currentTarget.style.boxShadow = '0 2px 12px rgba(0, 0, 0, 0.3)'
+              }
+            }}
+          >
+            <span>{selectedLab || 'Select a lab...'}</span>
+            <svg 
+              width="12" 
+              height="8" 
+              viewBox="0 0 12 8" 
+              fill="none" 
+              style={{
+                transition: 'transform 0.2s ease',
+                transform: labDropdownOpen ? 'rotate(180deg)' : 'rotate(0deg)'
+              }}
+            >
+              <path 
+                d="M1 1L6 6L11 1" 
+                stroke="#a78bfa" 
+                strokeWidth="2" 
+                strokeLinecap="round" 
+                strokeLinejoin="round"
+              />
+            </svg>
+          </button>
+          
+          {/* Dropdown List */}
+          {labDropdownOpen && (
+            <div style={{
+              position: 'absolute',
+              top: 'calc(100% + 4px)',
+              left: '0',
+              right: '0',
+              maxHeight: '240px',
+              overflowY: 'auto',
+              background: 'rgba(30, 30, 50, 0.95)',
+              backdropFilter: 'blur(20px)',
+              borderRadius: '10px',
+              border: '1px solid rgba(167, 139, 250, 0.4)',
+              boxShadow: '0 8px 32px rgba(0, 0, 0, 0.5)',
+              zIndex: 1000,
+              padding: '4px'
+            }}>
+              {Object.keys(labFiles).sort().map(lab => (
+                <button
+                  key={lab}
+                  onClick={() => {
+                    setSelectedLab(lab)
+                    setLabDropdownOpen(false)
+                  }}
+                  style={{
+                    width: '100%',
+                    padding: '10px 12px',
+                    background: selectedLab === lab 
+                      ? 'rgba(167, 139, 250, 0.2)' 
+                      : 'transparent',
+                    border: 'none',
+                    borderRadius: '6px',
+                    color: '#f3f4f6',
+                    fontSize: '14px',
+                    fontWeight: selectedLab === lab ? '600' : '500',
+                    cursor: 'pointer',
+                    transition: 'all 0.15s ease',
+                    textAlign: 'left',
+                    marginBottom: '2px'
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.background = 'rgba(167, 139, 250, 0.15)'
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background = selectedLab === lab 
+                      ? 'rgba(167, 139, 250, 0.2)' 
+                      : 'transparent'
+                  }}
+                >
+                  {lab}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
 
         {selectedLab && (
           <>
@@ -1053,7 +1532,7 @@ function App() {
               alignItems: 'center',
               justifyContent: 'center',
               cursor: 'pointer',
-              background: 'linear-gradient(135deg, rgba(102, 126, 234, 0.15) 0%, rgba(118, 75, 162, 0.15) 100%)', // Glassy purple
+              background: 'linear-gradient(135deg, rgba(80, 90, 160, 0.12) 0%, rgba(90, 70, 120, 0.12) 100%)', // Darker, less saturated purple
               backdropFilter: 'blur(10px)',
               borderRight: '1px solid rgba(255, 255, 255, 0.15)',
               borderBottomRightRadius: '28px', // Larger radius for the extended bottom
@@ -1076,13 +1555,92 @@ function App() {
               }
             }}
           >
-            <span style={{ 
+            {/* Cat emoji with negative space features */}
+            <span style={{
+              position: 'relative',
               fontSize: '32px',
               background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
               WebkitBackgroundClip: 'text',
               WebkitTextFillColor: 'transparent',
               filter: 'drop-shadow(0 2px 4px rgba(102, 126, 234, 0.3))'
-            }}>🐱</span>
+            }}>
+              🐱
+              {/* Negative space features */}
+              <span style={{
+                position: 'absolute',
+                top: '38%',
+                left: '32%',
+                width: '3px',
+                height: '5px',
+                background: 'rgba(15, 15, 30, 1)',
+                borderRadius: '50% 50% 50% 50% / 60% 60% 40% 40%',
+                transform: 'rotate(-5deg)',
+                pointerEvents: 'none'
+              }}></span>
+              <span style={{
+                position: 'absolute',
+                top: '38%',
+                right: '32%',
+                width: '3px',
+                height: '5px',
+                background: 'rgba(15, 15, 30, 1)',
+                borderRadius: '50% 50% 50% 50% / 60% 60% 40% 40%',
+                transform: 'rotate(5deg)',
+                pointerEvents: 'none'
+              }}></span>
+              <span style={{
+                position: 'absolute',
+                top: '54%',
+                left: '12%',
+                width: '8px',
+                height: '1px',
+                background: 'rgba(15, 15, 30, 1)',
+                transform: 'rotate(-12deg)',
+                pointerEvents: 'none'
+              }}></span>
+              <span style={{
+                position: 'absolute',
+                top: '60%',
+                left: '8%',
+                width: '9px',
+                height: '1px',
+                background: 'rgba(15, 15, 30, 1)',
+                transform: 'rotate(-4deg)',
+                pointerEvents: 'none'
+              }}></span>
+              <span style={{
+                position: 'absolute',
+                top: '54%',
+                right: '12%',
+                width: '8px',
+                height: '1px',
+                background: 'rgba(15, 15, 30, 1)',
+                transform: 'rotate(12deg)',
+                pointerEvents: 'none'
+              }}></span>
+              <span style={{
+                position: 'absolute',
+                top: '60%',
+                right: '8%',
+                width: '9px',
+                height: '1px',
+                background: 'rgba(15, 15, 30, 1)',
+                transform: 'rotate(4deg)',
+                pointerEvents: 'none'
+              }}></span>
+              <span style={{
+                position: 'absolute',
+                top: '58%',
+                left: '50%',
+                transform: 'translateX(-50%)',
+                width: '0',
+                height: '0',
+                borderLeft: '2.5px solid transparent',
+                borderRight: '2.5px solid transparent',
+                borderTop: '3px solid rgba(15, 15, 30, 1)',
+                pointerEvents: 'none'
+              }}></span>
+            </span>
           </div>
           
           {/* Top bar bottom border - hidden when sidebar expanded */}
@@ -1098,28 +1656,31 @@ function App() {
             transition: 'opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1)'
           }} />
           
-          {/* Centered title when no file is loaded */}
+          {/* Centered title when no file is loaded - positioned relative to main viewer, not top bar */}
           {!selectedFile && (
             <div style={{
-              position: 'absolute',
-              left: '50%',
-              top: '50%',
+              position: 'fixed',
+              left: sidebarVisible ? 'calc(50% + 140px)' : '50%',
+              top: '30px', // Vertically centered in the top bar (60px / 2 = 30px)
               transform: 'translate(-50%, -50%)',
               fontSize: '26px',
-              fontWeight: '700',
+              fontWeight: '800',
+              fontFamily: "'Poppins', sans-serif",
               background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
               WebkitBackgroundClip: 'text',
               WebkitTextFillColor: 'transparent',
               letterSpacing: '-0.5px',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '10px',
               opacity: sidebarVisible ? 0 : 1,
-              transition: 'opacity 0.3s ease-out',
-              pointerEvents: sidebarVisible ? 'none' : 'auto'
+              transition: 'all 0.3s ease-out',
+              pointerEvents: sidebarVisible ? 'none' : 'auto',
+              zIndex: 101,
+              textShadow: '0 0 30px rgba(102, 126, 234, 0.4), 0 0 60px rgba(118, 75, 162, 0.2)',
+              filter: 'drop-shadow(0 2px 8px rgba(102, 126, 234, 0.3))',
+              WebkitTextStroke: '0.5px rgba(102, 126, 234, 0.15)',
+              userSelect: 'none',
+              WebkitUserSelect: 'none'
             }}>
-              <span style={{ fontSize: '28px' }}>🐱</span>
-              <span>MABe Mouser</span>
+              MABe Mouser
             </div>
           )}
           
@@ -1147,7 +1708,7 @@ function App() {
                   color: 'rgba(229, 231, 235, 0.7)',
                   fontFamily: 'monospace'
                 }}>
-                  <span style={{ color: '#a78bfa' }}>Frame</span> {currentFrame + 1} / {frames.length}
+                  <span style={{ color: '#a78bfa' }}>Frame</span> {currentFrame} / {metadata?.total_frames || frames.length}
                   {metadata && metadata.fps && (
                     <span style={{ marginLeft: '12px', color: 'rgba(96, 165, 250, 0.8)' }}>
                       {metadata.fps} FPS
@@ -1303,11 +1864,79 @@ function App() {
               willChange: 'contents'
             }}>
               <EnhancedViewer
-                frame={frames[currentFrame]}
+                frame={getFrame(currentFrame) || lastValidFrame || null}
                 metadata={metadata}
                 viewState={viewState}
                 onViewStateChange={({ viewState }: any) => setViewState(viewState)}
+                onMouseClick={(mouseId: string) => {
+                  // If clicking the same mouse or background, release tracking
+                  if (trackedMouseId === mouseId || !mouseId) {
+                    setTrackedMouseId(null)
+                    lastTrackedPositionRef.current = null
+                  } else {
+                    setTrackedMouseId(mouseId)
+                    lastTrackedPositionRef.current = null // Reset position when switching mice
+                  }
+                }}
+                onViewerClick={() => {
+                  setTrackedMouseId(null)
+                  lastTrackedPositionRef.current = null
+                }}
+                trackedMouseId={trackedMouseId}
               />
+              
+              {/* Tracking Indicator */}
+              {trackedMouseId !== null && frames && frames.length > 0 && (() => {
+                const frame = getFrame(currentFrame)
+                if (!frame || !frame.mice || !frame.mice[trackedMouseId]) return null
+                
+                // Get mouse color
+                const mouseIndex = parseInt(trackedMouseId)
+                const baseColors: [number, number, number][] = [
+                  [255, 99, 71],   // tomato
+                  [135, 206, 250], // sky blue
+                  [144, 238, 144], // light green
+                  [255, 215, 0],   // gold
+                  [221, 160, 221], // plum
+                  [255, 165, 0],   // orange
+                  [173, 216, 230], // light blue
+                  [255, 182, 193]  // light pink
+                ]
+                const baseColor = baseColors[mouseIndex % baseColors.length]
+                const colorStr = `rgb(${baseColor[0]}, ${baseColor[1]}, ${baseColor[2]})`
+                
+                return (
+                  <div style={{
+                    position: 'absolute',
+                    bottom: '94px',
+                    left: '50%',
+                    transform: 'translateX(-50%)',
+                    padding: '8px 16px',
+                    background: 'rgba(17, 24, 39, 0.95)',
+                    border: `2px solid ${colorStr}`,
+                    borderRadius: '8px',
+                    color: colorStr,
+                    fontFamily: "'Inter', sans-serif",
+                    fontWeight: 600,
+                    fontSize: '14px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    pointerEvents: 'none',
+                    zIndex: 1000,
+                    boxShadow: `0 0 20px ${colorStr}40`
+                  }}>
+                    <div style={{
+                      width: '8px',
+                      height: '8px',
+                      borderRadius: '50%',
+                      backgroundColor: colorStr,
+                      boxShadow: `0 0 8px ${colorStr}`
+                    }} />
+                    Tracking Mouse {trackedMouseId}
+                  </div>
+                )
+              })()}
             </div>
           )}
 
@@ -1431,16 +2060,16 @@ function App() {
           )}
         </div>
 
-        {/* Timeline */}
+        {/* Timeline - YouTube Style: Always small with popup preview */}
         {frames && frames.length > 0 && metadata && (
           <>
-            {/* Hover detection area - larger than visual timeline for better UX */}
+            {/* Hover detection area */}
             <div style={{
               position: 'absolute',
               bottom: '64px',
               left: '0',
               right: '0',
-              height: '80px', // Larger than expanded timeline (72px) for easier triggering
+              height: '30px', // Small hover area above timeline
               zIndex: 1000,
               pointerEvents: 'auto',
               cursor: isDragging ? 'none' : 'pointer'
@@ -1449,35 +2078,54 @@ function App() {
               setTimelineHovered(true)
             }}
             onMouseMove={(e) => {
-              // Update mouse position for tracking line
               if (canvasRef.current) {
                 const rect = canvasRef.current.getBoundingClientRect()
                 const x = e.clientX - rect.left
                 setTimelineMouseX(x)
                 
-                // Scrub while dragging (YouTube-style)
+                // Scrub while dragging
                 if (isDragging) {
-                  const totalFrames = metadata.total_frames || frames.length
+                  const totalFrames = metadata.total_frames
                   const frame = Math.floor((x / rect.width) * totalFrames)
-                  setCurrentFrame(Math.max(0, Math.min(frame, totalFrames - 1)))
+                  const clampedFrame = Math.max(0, Math.min(frame, totalFrames - 1))
+                  setCurrentFrame(clampedFrame)
+                  
+                  // Use throttled seek to prevent spamming backend during rapid scrubbing
+                  if (!isFrameLoaded(clampedFrame)) {
+                    throttledSeek(clampedFrame)
+                  }
                 }
               }
             }}
             onMouseDown={(e) => {
               if (canvasRef.current) {
+                // Save play state before scrubbing starts
+                setPlayStateBeforeScrub(playing)
+                
                 setIsDragging(true)
                 const rect = canvasRef.current.getBoundingClientRect()
                 const x = e.clientX - rect.left
-                const totalFrames = metadata.total_frames || frames.length
+                const totalFrames = metadata.total_frames
                 const frame = Math.floor((x / rect.width) * totalFrames)
-                setCurrentFrame(Math.max(0, Math.min(frame, totalFrames - 1)))
+                const clampedFrame = Math.max(0, Math.min(frame, totalFrames - 1))
+                setCurrentFrame(clampedFrame)
                 
-                // Pause playback when starting to drag
-                if (playing) setPlaying(false)
+                // If frame isn't loaded, trigger IMMEDIATE seek (bypass throttle)
+                if (!isFrameLoaded(clampedFrame)) {
+                  console.log(`🎯 Clicked unloaded frame ${clampedFrame}, seeking immediately...`)
+                  // Clear pending seeks and throttle state
+                  pendingSeekRef.current = null
+                  lastSeekTimeRef.current = Date.now()
+                  isSeekingRef.current = true
+                  // Immediate seek
+                  seekToFrame(clampedFrame)
+                }
+                
+                // Pause playback while scrubbing
+                setPlaying(false)
               }
             }}
             onMouseLeave={() => {
-              // Collapse timeline when mouse leaves detection area (unless scrubbing)
               if (!isDragging) {
                 setTimelineHovered(false)
                 setTimelineMouseX(null)
@@ -1485,92 +2133,196 @@ function App() {
             }}
             />
             
-            <div style={{
-              position: 'absolute',
-              bottom: '64px',
-              left: '0',
-              right: '0',
-              zIndex: 10,
-              pointerEvents: 'none' // Don't interfere with hover detection area
-            }}
-            >
+            {/* Timeline canvas - always small (8px) */}
             <canvas
               ref={canvasRef}
               style={{
+                position: 'absolute',
+                bottom: '64px',
+                left: '0',
+                right: '0',
                 width: '100%',
-                height: timelineHovered ? '72px' : '8px',
+                height: '8px', // Always small like YouTube
                 cursor: 'pointer',
-                borderTop: '1px solid rgba(255, 255, 255, 0.1)',
-                background: 'rgba(20, 20, 35, 0.6)',
-                backdropFilter: 'blur(10px)',
-                transition: 'all 0.25s cubic-bezier(0.4, 0, 0.2, 1)',
+                borderTop: '0.5px solid rgba(255, 255, 255, 0.1)',
+                background: 'rgba(20, 20, 35, 0.8)',
+                zIndex: 10,
                 display: 'block',
-                willChange: 'height',
                 pointerEvents: 'none' // Events handled by hover detection area
               }}
             />
             
-            {/* Mouse position preview - shows when hovering over expanded timeline */}
-            {timelineHovered && timelineMouseX !== null && metadata && (
-              <div style={{
-                position: 'absolute',
-                left: isDragging 
-                  ? `${((currentFrame / (metadata.total_frames || frames.length)) * (canvasRef.current?.getBoundingClientRect().width || 0))}px`
-                  : `${timelineMouseX}px`, // During scrubbing, lock to playback position
-                top: '0',
-                bottom: '0',
-                pointerEvents: 'none',
-                zIndex: 100
-              }}>
-                {/* Vertical line tracker */}
-                <div style={{
-                  position: 'absolute',
-                  left: '0',
-                  top: '0',
-                  bottom: '0',
-                  width: '2px',
-                  background: 'rgba(255, 255, 255, 0.6)',
-                  boxShadow: '0 0 8px rgba(255, 255, 255, 0.4)'
-                }} />
+            {/* YouTube-style popup frame preview */}
+            {timelineHovered && timelineMouseX !== null && metadata && !isDragging && previewFrameNumber !== null && (
+              (() => {
+                const rect = canvasRef.current?.getBoundingClientRect()
+                if (!rect) return null
                 
-                {/* Time preview label */}
-                <div style={{
-                  position: 'absolute',
-                  left: '50%',
-                  top: '-32px',
-                  transform: 'translateX(-50%)',
-                  background: 'rgba(20, 20, 35, 0.95)',
-                  backdropFilter: 'blur(10px)',
-                  padding: '4px 10px',
-                  borderRadius: '6px',
-                  fontSize: '12px',
-                  fontWeight: '600',
-                  color: '#e5e7eb',
-                  whiteSpace: 'nowrap',
-                  border: '1px solid rgba(255, 255, 255, 0.1)',
-                  boxShadow: '0 4px 12px rgba(0, 0, 0, 0.4)'
-                }}>
-                  {(() => {
-                    const canvasRect = canvasRef.current?.getBoundingClientRect()
-                    if (!canvasRect) return ''
+                // Calculate position - center popup on mouse, but clamp to screen edges
+                const popupWidth = 200
+                const popupHeight = 150
+                let popupX = timelineMouseX - popupWidth / 2
+                
+                // Clamp to screen bounds
+                popupX = Math.max(10, Math.min(popupX, rect.width - popupWidth - 10))
+                
+                return (
+                  <div style={{
+                    position: 'absolute',
+                    left: `${popupX}px`,
+                    bottom: '80px', // Above timeline
+                    width: `${popupWidth}px`,
+                    height: `${popupHeight}px`,
+                    background: 'rgba(20, 20, 35, 0.95)',
+                    backdropFilter: 'blur(20px)',
+                    border: '0.5px solid rgba(255, 255, 255, 0.2)',
+                    borderRadius: '8px',
+                    zIndex: 2000,
+                    pointerEvents: 'none',
+                    boxShadow: '0 8px 32px rgba(0, 0, 0, 0.6)',
+                    padding: '8px',
+                    animation: 'fadeIn 0.1s ease-out',
+                    userSelect: 'none',
+                    WebkitUserSelect: 'none',
+                    MozUserSelect: 'none',
+                    msUserSelect: 'none'
+                  }}>
+                    {/* Frame preview */}
+                    <div style={{
+                      width: '100%',
+                      height: 'calc(100% - 30px)',
+                      background: 'rgba(30, 30, 45, 0.8)',
+                      borderRadius: '4px',
+                      overflow: 'hidden',
+                      position: 'relative',
+                      userSelect: 'none'
+                    }}>
+                      {previewFrame && metadata ? (() => {
+                        // Render a mini visualization of the frame
+                        const mice = previewFrame.mice || {}
+                        const mouseIds = Object.keys(mice)
+                        
+                        // Calculate bounds to fit all points
+                        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+                        mouseIds.forEach(mouseId => {
+                          const mouseData = mice[mouseId]
+                          mouseData.points.forEach((point: number[]) => {
+                            minX = Math.min(minX, point[0])
+                            minY = Math.min(minY, point[1])
+                            maxX = Math.max(maxX, point[0])
+                            maxY = Math.max(maxY, point[1])
+                          })
+                        })
+                        
+                        const dataWidth = maxX - minX
+                        const dataHeight = maxY - minY
+                        const padding = 10
+                        const viewWidth = popupWidth - 16 // Account for popup padding
+                        const viewHeight = popupHeight - 46 // Account for time label
+                        
+                        const scale = Math.min(
+                          (viewWidth - padding * 2) / dataWidth,
+                          (viewHeight - padding * 2) / dataHeight
+                        )
+                        
+                        const offsetX = (viewWidth - dataWidth * scale) / 2 - minX * scale
+                        // Flip Y coordinate to match viewer orientation
+                        const offsetY = (viewHeight - dataHeight * scale) / 2 + maxY * scale
+                        
+                        return (
+                          <svg
+                            width="100%"
+                            height="100%"
+                            viewBox={`0 0 ${viewWidth} ${viewHeight}`}
+                            style={{ display: 'block' }}
+                          >
+                            {mouseIds.map((mouseId) => {
+                              const mouseData = mice[mouseId]
+                              // Use same colors as EnhancedViewer - map by mouseId, not index
+                              const color = MOUSE_COLORS_HEX[parseInt(mouseId) % MOUSE_COLORS_HEX.length]
+                              
+                              return (
+                                <g key={mouseId}>
+                                  {/* Draw lines connecting points */}
+                                  {mouseData.points.map((point: number[], i: number) => {
+                                    if (i === 0) return null
+                                    const prev = mouseData.points[i - 1]
+                                    return (
+                                      <line
+                                        key={i}
+                                        x1={prev[0] * scale + offsetX}
+                                        y1={-prev[1] * scale + offsetY}
+                                        x2={point[0] * scale + offsetX}
+                                        y2={-point[1] * scale + offsetY}
+                                        stroke={color}
+                                        strokeWidth="1"
+                                        opacity="0.4"
+                                      />
+                                    )
+                                  })}
+                                  
+                                  {/* Draw points */}
+                                  {mouseData.points.map((point: number[], i: number) => (
+                                    <circle
+                                      key={i}
+                                      cx={point[0] * scale + offsetX}
+                                      cy={-point[1] * scale + offsetY}
+                                      r="1.5"
+                                      fill={color}
+                                      opacity="0.8"
+                                    />
+                                  ))}
+                                </g>
+                              )
+                            })}
+                          </svg>
+                        )
+                      })() : (
+                        <div style={{
+                          width: '100%',
+                          height: '100%',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          fontSize: '10px',
+                          color: 'rgba(255, 255, 255, 0.4)'
+                        }}>
+                          Loading...
+                        </div>
+                      )}
+                    </div>
                     
-                    const totalFrames = metadata.total_frames || frames.length
+                    {/* Time label */}
+                    <div style={{
+                      marginTop: '6px',
+                      textAlign: 'center',
+                      fontSize: '11px',
+                      color: '#fff',
+                      fontFamily: 'monospace'
+                    }}>
+                      {metadata.fps ? (() => {
+                        const seconds = previewFrameNumber / metadata.fps
+                        const mins = Math.floor(seconds / 60)
+                        const secs = Math.floor(seconds % 60)
+                        return `${mins}:${secs.toString().padStart(2, '0')}`
+                      })() : `Frame ${previewFrameNumber}`}
+                    </div>
                     
-                    // During scrubbing, show current frame time; during hover, show hover position
-                    const displayFrame = isDragging ? currentFrame : Math.floor((timelineMouseX / canvasRect.width) * totalFrames)
-                    
-                    if (metadata.fps) {
-                      const displayTimeSec = displayFrame / metadata.fps
-                      const mins = Math.floor(displayTimeSec / 60)
-                      const secs = Math.floor(displayTimeSec % 60)
-                      const ms = Math.floor((displayTimeSec % 1) * 100)
-                      return `${mins}:${secs.toString().padStart(2, '0')}.${ms.toString().padStart(2, '0')}`
-                    } else {
-                      return `Frame ${displayFrame + 1}`
-                    }
-                  })()}
-                </div>
-              </div>
+                    {/* Arrow pointing down to timeline */}
+                    <div style={{
+                      position: 'absolute',
+                      left: '50%',
+                      bottom: '-8px',
+                      transform: 'translateX(-50%)',
+                      width: '0',
+                      height: '0',
+                      borderLeft: '8px solid transparent',
+                      borderRight: '8px solid transparent',
+                      borderTop: '8px solid rgba(20, 20, 35, 0.95)'
+                    }} />
+                  </div>
+                )
+              })()
             )}
             
             {/* Behavior markers - start and end points for VALID behaviors only */}
@@ -1701,7 +2453,6 @@ function App() {
                 })}
               </>
             )}
-          </div>
           </>
         )}
 
@@ -1760,7 +2511,7 @@ function App() {
               {playing ? '⏸' : '▶'}
             </button>
 
-            {/* Timer Display - Center (or behavior name when hovering marker) */}
+            {/* Timer Display - Center */}
             <div style={{
               position: 'absolute',
               left: '50%',
@@ -1768,66 +2519,21 @@ function App() {
               fontSize: '13px',
               fontWeight: '600',
               color: '#e5e7eb',
-              fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto',
+              fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
               textShadow: '0 2px 4px rgba(0, 0, 0, 0.5)',
               userSelect: 'none'
             }}>
-              {(() => {
-                // Show behavior name when tracking line intersects a behavior range
-                if ((timelineHovered || isDragging) && metadata?.annotations) {
-                  const validBehaviors = ['chase', 'attack', 'avoid', 'escape', 'mount', 'groom', 'sniff']
-                  const canvasRect = canvasRef.current?.getBoundingClientRect()
-                  if (!canvasRect) return null
-                  
-                  const totalFrames = metadata.total_frames || frames.length
-                  const trackingFrame = isDragging 
-                    ? currentFrame 
-                    : timelineMouseX !== null 
-                      ? Math.floor((timelineMouseX / canvasRect.width) * totalFrames)
-                      : null
-                  
-                  if (trackingFrame !== null) {
-                    const intersectedBehavior = metadata.annotations.find((annotation: any) => {
-                      const actionLower = annotation.action.toLowerCase()
-                      if (!validBehaviors.includes(actionLower)) return false
-                      return trackingFrame >= annotation.start_frame && trackingFrame <= annotation.stop_frame
-                    })
-                    
-                    if (intersectedBehavior) {
-                      const behaviorColors: Record<string, string> = {
-                        'chase': '#ef4444',
-                        'attack': '#ef4444',
-                        'avoid': '#3b82f6',
-                        'escape': '#3b82f6',
-                        'mount': '#a855f7',
-                        'groom': '#10b981',
-                        'sniff': '#fbbf24'
-                      }
-                      const actionLower = intersectedBehavior.action.toLowerCase()
-                      const color = behaviorColors[actionLower] || '#6b7280'
-                      
-                      return (
-                        <span style={{ color, textTransform: 'capitalize' }}>
-                          {intersectedBehavior.action}
-                        </span>
-                      )
-                    }
-                  }
+              {metadata && metadata.fps ? (() => {
+                const totalFrames = metadata.total_frames || frames.length
+                const currentTimeSec = currentFrame / metadata.fps
+                const totalTimeSec = totalFrames / metadata.fps
+                const formatTime = (sec: number) => {
+                  const mins = Math.floor(sec / 60)
+                  const secs = Math.floor(sec % 60)
+                  return `${mins}:${secs.toString().padStart(2, '0')}`
                 }
-                
-                // Show time/frame normally
-                return metadata && metadata.fps ? (() => {
-                  const totalFrames = metadata.total_frames || frames.length
-                  const currentTimeSec = currentFrame / metadata.fps
-                  const totalTimeSec = totalFrames / metadata.fps
-                  const formatTime = (sec: number) => {
-                    const mins = Math.floor(sec / 60)
-                    const secs = Math.floor(sec % 60)
-                    return `${mins}:${secs.toString().padStart(2, '0')}`
-                  }
-                  return `${formatTime(currentTimeSec)} / ${formatTime(totalTimeSec)}`
-                })() : `Frame ${currentFrame + 1}/${(metadata?.total_frames || frames.length)}`
-              })()}
+                return `${formatTime(currentTimeSec)} / ${formatTime(totalTimeSec)}`
+              })() : `Frame ${currentFrame + 1}/${(metadata?.total_frames || frames.length)}`}
             </div>
 
             {/* Frame Navigation Buttons - Right Side */}

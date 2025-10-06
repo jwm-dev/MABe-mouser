@@ -3,5 +3,6 @@
 .venv/
 MABe-mouse-behavior-detection/
 backend/__pycache__/
+backend/backend.log
 frontend/node_modules/
 __pycache__/
