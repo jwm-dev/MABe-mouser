@@ -5,16 +5,21 @@ Serves parquet files from the dataset directory.
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 import pandas as pd
+import numpy as np
 from pathlib import Path
 import json
 import time
 import asyncio
 import traceback
+import random
+import os
 from typing import Optional, Dict, Any
 from functools import lru_cache
 
 from backend.models import FileInfo, FileResponse, FrameData, MouseData, FileMetadata
+from backend import analytics
 
 app = FastAPI(
     title="MABe Viewer API",
@@ -29,20 +34,30 @@ app.add_middleware(
         "http://localhost:3000",
         "http://localhost:5173",  # Vite default port
         "http://127.0.0.1:5173",
+        "http://localhost",        # Production
+        "http://127.0.0.1",        # Production
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Point to data directory
-BASE_DIR = Path(__file__).parent.parent / "MABe-mouse-behavior-detection"
-DATA_DIR = BASE_DIR / "train_tracking"
-ANNOTATION_DIR = BASE_DIR / "train_annotation"
+# Point to data directory - support both local dev and Docker paths
+DATA_DIR_ENV = os.getenv("DATA_DIR")
+if DATA_DIR_ENV:
+    DATA_DIR = Path(DATA_DIR_ENV)
+    BASE_DIR = DATA_DIR.parent
+    ANNOTATION_DIR = BASE_DIR / "train_annotation"
+else:
+    # Local development paths
+    BASE_DIR = Path(__file__).parent.parent / "MABe-mouse-behavior-detection"
+    DATA_DIR = BASE_DIR / "train_tracking"
+    ANNOTATION_DIR = BASE_DIR / "train_annotation"
 
 if not DATA_DIR.exists():
     print(f"⚠️  Warning: Data directory not found: {DATA_DIR}")
     print(f"   Current directory: {Path.cwd()}")
+    print(f"   Set DATA_DIR environment variable to specify dataset location")
 
 
 # Load annotations for a specific video
@@ -542,6 +557,68 @@ async def stream_file(
             "X-Accel-Buffering": "no",  # Disable nginx buffering
         }
     )
+
+
+# ==================== ANALYTICS ENDPOINTS ====================
+
+@app.get("/api/analytics/overview")
+async def get_analytics_overview():
+    """Get aggregated statistics across all datasets"""
+    try:
+        return analytics.get_overview_stats(DATA_DIR)
+    except Exception as e:
+        print(f"❌ Overview error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/analytics/heatmap")
+async def get_heatmap_data(target_points: int = 500000):
+    """Get normalized spatial heatmap data with metadata for filtering"""
+    try:
+        return analytics.get_heatmap_data(DATA_DIR, target_points)
+    except Exception as e:
+        print(f"❌ Heatmap error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/analytics/activity")
+async def get_activity_data(target_sessions: int = 100, bins: int = 100):
+    """Get normalized activity timeline across entire dataset with metadata for filtering"""
+    try:
+        return analytics.get_activity_timeline(DATA_DIR, target_sessions, bins)
+    except Exception as e:
+        print(f"❌ Activity error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/analytics/social")
+async def get_social_network_data():
+    """Get social interaction network"""
+    try:
+        return analytics.get_social_network(DATA_DIR)
+    except Exception as e:
+        print(f"❌ Social network error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/analytics/browser")
+async def get_dataset_browser_data():
+    """Get complete dataset browser information"""
+    try:
+        return analytics.get_dataset_browser(DATA_DIR)
+    except Exception as e:
+        print(f"❌ Dataset browser error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Serve frontend static files in production (after all API routes)
+FRONTEND_BUILD_DIR = Path(__file__).parent.parent / "frontend" / "dist"
+if FRONTEND_BUILD_DIR.exists() and (FRONTEND_BUILD_DIR / "index.html").exists():
+    app.mount("/", StaticFiles(directory=str(FRONTEND_BUILD_DIR), html=True), name="static")
+    print(f"✅ Serving frontend static files from {FRONTEND_BUILD_DIR}")
+else:
+    print(f"⚠️  Frontend build not found at {FRONTEND_BUILD_DIR}")
+    print(f"   Run 'cd frontend && npm run build' to create production build")
 
 
 if __name__ == "__main__":

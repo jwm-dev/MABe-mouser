@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    container_name: mabe-mouser-backend
+    ports:
+      - "87001:8000"
+    volumes:
+      # IMPORTANT: Update this path to point to your dataset location
+      - ./MABe-mouse-behavior-detection:/app/data:ro
+      # For development: uncomment to enable hot-reload
+      # - ./backend:/app/backend
+      # - ./src:/app/src
+    environment:
+      - CUDA_VISIBLE_DEVICES=0,1  # Use both GPUs (adjust as needed)
+      - DATA_DIR=/app/data/train_tracking
+      - METADATA_CSV=/app/data/train.csv
+      - PYTHONUNBUFFERED=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 2  # Number of GPUs to use
+              capabilities: [gpu]
+    restart: unless-stopped
+    networks:
+      - mabe-network
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import requests; requests.get('http://localhost:8000/api/files')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    container_name: mabe-mouser-frontend
+    ports:
+      - "87000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - mabe-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+networks:
+  mabe-network:
+    driver: bridge

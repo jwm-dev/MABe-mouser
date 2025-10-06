@@ -1,0 +1,48 @@
+# Portainer Stack Configuration for MABe Mouser
+# Deploy this as a Stack in Portainer UI
+
+version: '3.8'
+
+services:
+  backend:
+    image: mabe-mouser-backend:latest
+    container_name: mabe-mouser-backend
+    ports:
+      - "87001:8000"
+    volumes:
+      # IMPORTANT: Update this path to your dataset location on the server
+      - /path/to/your/MABe-dataset:/app/data:ro
+    environment:
+      - CUDA_VISIBLE_DEVICES=0,1
+      - DATA_DIR=/app/data/train_tracking
+      - METADATA_CSV=/app/data/train.csv
+      - PYTHONUNBUFFERED=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 2
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import requests; requests.get('http://localhost:8000/api/files')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  frontend:
+    image: mabe-mouser-frontend:latest
+    container_name: mabe-mouser-frontend
+    ports:
+      - "87000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s

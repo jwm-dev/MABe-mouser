@@ -7,6 +7,8 @@ interface FrameData {
 
 interface FileMetadata {
   total_frames: number
+  min_frame: number
+  max_frame: number
   num_mice: number
   fps?: number
   video_width?: number
@@ -106,17 +108,36 @@ export function useSmartLoading({
   const addFrames = useCallback((frames: FrameData[]) => {
     if (frames.length === 0) return
     
+    const meta = metadataRef.current
+    if (!meta) {
+      // Metadata not yet available - store frames with actual frame numbers temporarily
+      // They will be re-indexed when metadata arrives
+      console.log(`⏳ Storing ${frames.length} frames temporarily (metadata pending)`)
+      setFramesMap(prev => {
+        const newMap = new Map(prev)
+        frames.forEach(frame => {
+          newMap.set(frame.frame_number, frame)
+        })
+        return newMap
+      })
+      return
+    }
+    
     setFramesMap(prev => {
       const newMap = new Map(prev)
       frames.forEach(frame => {
-        newMap.set(frame.frame_number, frame)
+        // Convert actual parquet frame number to 0-indexed display frame
+        const displayFrame = frame.frame_number - meta.min_frame
+        // Store frame with 0-indexed key but keep original frame_number
+        newMap.set(displayFrame, frame)
       })
       return newMap
     })
 
-    // Update loaded ranges
-    const minFrame = Math.min(...frames.map(f => f.frame_number))
-    const maxFrame = Math.max(...frames.map(f => f.frame_number))
+    // Update loaded ranges using 0-indexed frames
+    const displayFrames = frames.map(f => f.frame_number - meta.min_frame)
+    const minFrame = Math.min(...displayFrames)
+    const maxFrame = Math.max(...displayFrames)
     
     setLoadedRanges(prev => mergeRanges([...prev, { start: minFrame, end: maxFrame }]))
   }, [mergeRanges])
@@ -137,14 +158,24 @@ export function useSmartLoading({
       eventSourceRef.current = null
     }
     
-    // Track where we're loading from
+    // Track where we're loading from (using display frame)
     currentLoadStartRef.current = startFrame
     
-    console.log(`📡 Starting continuous load from frame ${startFrame}`)
+    const meta = metadataRef.current
+    let actualFrame = startFrame
+    
+    // If metadata is available, convert to actual parquet frame
+    if (meta) {
+      actualFrame = startFrame + meta.min_frame
+      console.log(`📡 Starting continuous load from display frame ${startFrame} (actual frame ${actualFrame})`)
+    } else {
+      // First load - metadata will come in the stream
+      console.log(`📡 Starting initial load from frame ${startFrame} (metadata will be received)`)
+    }
     
     setLoading(true)
     
-    const url = `/api/files/${lab}/${filename}/stream?start_frame=${startFrame}&chunk_size=${chunkSize}`
+    const url = `/api/files/${lab}/${filename}/stream?start_frame=${actualFrame}&chunk_size=${chunkSize}`
     const eventSource = new EventSource(url)
     eventSourceRef.current = eventSource
 
@@ -163,9 +194,31 @@ export function useSmartLoading({
 
         // Handle metadata
         if (data.metadata) {
-          console.log(`📊 Metadata: ${data.metadata.total_frames} frames`)
+          console.log(`📊 Metadata received: ${data.metadata.total_frames} frames (${data.metadata.min_frame}-${data.metadata.max_frame})`)
           setMetadata(data.metadata)
           metadataRef.current = data.metadata
+          
+          // If we have frames that were stored with actual frame numbers, re-index them
+          if (framesMapRef.current.size > 0) {
+            console.log(`🔄 Re-indexing ${framesMapRef.current.size} frames with metadata`)
+            const existingFrames = Array.from(framesMapRef.current.values())
+            
+            // Re-add with proper 0-indexed keys
+            const newMap = new Map<number, FrameData>()
+            existingFrames.forEach(frame => {
+              const displayFrame = frame.frame_number - data.metadata.min_frame
+              newMap.set(displayFrame, frame)
+            })
+            setFramesMap(newMap)
+            framesMapRef.current = newMap
+            
+            // Update loaded ranges
+            const displayFrames = existingFrames.map(f => f.frame_number - data.metadata.min_frame)
+            const minFrame = Math.min(...displayFrames)
+            const maxFrame = Math.max(...displayFrames)
+            setLoadedRanges([{ start: minFrame, end: maxFrame }])
+            loadedRangesRef.current = [{ start: minFrame, end: maxFrame }]
+          }
           return
         }
 
@@ -245,30 +298,38 @@ export function useSmartLoading({
 
   // Fetch a single frame on demand (for preview hover)
   const fetchFrame = useCallback(async (frameNumber: number): Promise<FrameData | null> => {
+    const meta = metadataRef.current
+    if (!meta) {
+      console.warn('⚠️ Cannot fetch frame without metadata')
+      return null
+    }
+    
     // If already loaded, return immediately
     const existingFrame = framesMap.get(frameNumber)
     if (existingFrame) {
-      console.log(`📦 Frame ${frameNumber} already in cache`)
+      console.log(`📦 Display frame ${frameNumber} already in cache`)
       return existingFrame
     }
 
-    console.log(`🌐 Fetching frame ${frameNumber} from server...`)
+    // Convert 0-indexed display frame to actual parquet frame number
+    const actualFrame = frameNumber + meta.min_frame
+    console.log(`🌐 Fetching display frame ${frameNumber} (actual frame ${actualFrame}) from server...`)
     
     try {
-      const url = `/api/files/${lab}/${filename}/frame/${frameNumber}`
+      const url = `/api/files/${lab}/${filename}/frame/${actualFrame}`
       console.log(`🔗 Request URL: ${url}`)
       
       const response = await fetch(url)
       
       if (!response.ok) {
-        console.error(`❌ Server returned ${response.status} for frame ${frameNumber}`)
+        console.error(`❌ Server returned ${response.status} for frame ${actualFrame}`)
         return null
       }
       
       const data = await response.json()
-      console.log(`✅ Frame ${frameNumber} fetched successfully:`, data)
+      console.log(`✅ Frame ${actualFrame} fetched successfully:`, data)
       
-      // Add to framesMap for future use
+      // Add to framesMap for future use (using display frame as key)
       setFramesMap(prev => {
         const next = new Map(prev)
         next.set(frameNumber, data)

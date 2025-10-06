@@ -396,21 +396,34 @@ function Dashboard() {
             </div>
 
             {/* Placeholder cards for future features */}
-            <div style={{
-              background: 'rgba(30, 30, 45, 0.4)',
+            <div 
+              onClick={() => navigate('/analytics')}
+              style={{
+              background: 'linear-gradient(135deg, rgba(102, 126, 234, 0.15) 0%, rgba(118, 75, 162, 0.15) 100%)',
               backdropFilter: 'blur(10px)',
-              border: '1px solid rgba(255, 255, 255, 0.1)',
+              border: '1px solid rgba(102, 126, 234, 0.3)',
               borderRadius: '16px',
               padding: '32px',
-              opacity: 0.5,
+              cursor: 'pointer',
+              transition: 'all 0.3s ease',
               position: 'relative',
               overflow: 'hidden'
-            }}>
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.transform = 'translateY(-8px)'
+              e.currentTarget.style.boxShadow = '0 20px 60px rgba(102, 126, 234, 0.3)'
+              e.currentTarget.style.borderColor = 'rgba(102, 126, 234, 0.5)'
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.transform = 'translateY(0)'
+              e.currentTarget.style.boxShadow = 'none'
+              e.currentTarget.style.borderColor = 'rgba(102, 126, 234, 0.3)'
+            }}
+            >
               <div style={{ position: 'relative', zIndex: 1 }}>
                 <div style={{
                   fontSize: '48px',
-                  marginBottom: '16px',
-                  opacity: 0.5
+                  marginBottom: '16px'
                 }}>
                   📊
                 </div>
@@ -418,7 +431,7 @@ function Dashboard() {
                   fontSize: '24px',
                   fontWeight: '700',
                   fontFamily: "'Poppins', sans-serif",
-                  color: '#8b8b9f',
+                  color: '#e5e7eb',
                   marginBottom: '12px',
                   letterSpacing: '-0.5px'
                 }}>
@@ -426,12 +439,37 @@ function Dashboard() {
                 </h2>
                 <p style={{
                   fontSize: '15px',
-                  color: 'rgba(139, 139, 159, 0.7)',
+                  color: 'rgba(229, 231, 235, 0.8)',
                   lineHeight: '1.6',
-                  marginBottom: '0'
+                  marginBottom: '20px'
                 }}>
-                  Coming soon: Statistical analysis and behavior pattern recognition tools.
+                  Explore datasets with spatial heatmaps, activity timelines, social networks, and ML feature engineering tools.
                 </p>
+                
+                {/* Launch button */}
+                <div style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  fontSize: '14px',
+                  fontWeight: '600',
+                  color: '#667eea',
+                  marginTop: '16px',
+                  transition: 'gap 0.2s ease'
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.gap = '12px'
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.gap = '8px'
+                }}
+                >
+                  Launch Analytics
+                  <span style={{
+                    fontSize: '16px',
+                    transition: 'transform 0.2s ease'
+                  }}>→</span>
+                </div>
               </div>
             </div>
 

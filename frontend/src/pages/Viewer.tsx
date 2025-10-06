@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { useNavigate, useLocation } from 'react-router-dom'
 import { EnhancedViewer } from '../components/EnhancedViewer'
 import { useSmartLoading } from '../hooks/useSmartLoading'
 import '../App.css'
@@ -22,9 +23,17 @@ interface FileInfo {
 }
 
 function Viewer() {
+  const navigate = useNavigate()
+  const location = useLocation()
+  
+  // Check if we're auto-loading from analytics IMMEDIATELY on mount
+  const state = location.state as { loadSession?: { video_id: string; lab_id: string } } | null
+  const shouldAutoLoad = !!state?.loadSession
+  
   const [labFiles, setLabFiles] = useState<Record<string, FileInfo[]>>({})
   const [selectedLab, setSelectedLab] = useState<string>('')
   const [selectedFile, setSelectedFile] = useState<FileInfo | null>(null)
+  const [isAutoLoading, setIsAutoLoading] = useState(shouldAutoLoad) // Set immediately if we have loadSession state
   const [currentFrame, setCurrentFrame] = useState(0)
   const [playing, setPlaying] = useState(false)
   const [timelineHovered, setTimelineHovered] = useState(false)
@@ -112,14 +121,53 @@ function Viewer() {
       .then(res => res.json())
       .then(data => {
         setLabFiles(data.labs || {})
-        // Auto-select first lab
-        const firstLab = Object.keys(data.labs || {})[0]
-        if (firstLab) {
-          setSelectedLab(firstLab)
+        
+        // Check if we came from analytics with a specific session to load
+        const state = location.state as { loadSession?: { video_id: string; lab_id: string } } | null
+        if (state?.loadSession) {
+          setIsAutoLoading(true) // Mark that we're auto-loading
+          const { video_id, lab_id } = state.loadSession
+          console.log(`📂 Auto-loading session from analytics: ${video_id} from ${lab_id}`)
+          
+          // Find the matching file in the lab files
+          const labData = data.labs?.[lab_id]
+          if (labData) {
+            // Match by filename without extension (video_id might be number or string)
+            const matchingFile = labData.find((f: FileInfo) => {
+              const fileBaseName = f.name.replace(/\.parquet$/, '')
+              return fileBaseName === String(video_id)
+            })
+            if (matchingFile) {
+              console.log(`✅ Setting lab to: ${lab_id}`)
+              console.log(`✅ Setting file to: ${matchingFile.name}`)
+              setSelectedLab(lab_id)
+              setSelectedFile(matchingFile)
+              loadFile(matchingFile)
+              setIsAutoLoading(false) // Auto-load complete
+              console.log(`✅ Auto-loaded: ${matchingFile.name} from ${lab_id}`)
+            } else {
+              setIsAutoLoading(false)
+              console.warn(`⚠️ File ${video_id}.parquet not found in lab ${lab_id}`)
+              console.log('Available files:', labData.map((f: FileInfo) => f.name).slice(0, 5))
+            }
+          } else {
+            setIsAutoLoading(false)
+            console.warn(`⚠️ Lab ${lab_id} not found in file list`)
+            console.log('Available labs:', Object.keys(data.labs || {}))
+          }
+          
+          // Clear the navigation state so it doesn't reload on refresh
+          navigate(location.pathname, { replace: true, state: {} })
+        } else {
+          // Only auto-select first lab if NOT auto-loading from analytics
+          const firstLab = Object.keys(data.labs || {})[0]
+          if (firstLab) {
+            setSelectedLab(firstLab)
+          }
         }
       })
       .catch(err => console.error('Failed to load file list:', err))
-  }, [])
+  }, []) // Empty dependency array - only run once on mount
 
   // Load file data when selected (just update state, hook will auto-trigger)
   const loadFile = useCallback(async (file: FileInfo) => {
@@ -701,8 +749,15 @@ function Viewer() {
           alignItems: 'center',
           gap: '10px',
           userSelect: 'none',
-          WebkitUserSelect: 'none'
-        }}>
+          WebkitUserSelect: 'none',
+          cursor: 'pointer',
+          transition: 'opacity 0.2s ease',
+          opacity: 1
+        }}
+        onClick={() => navigate('/')}
+        onMouseEnter={(e) => e.currentTarget.style.opacity = '0.7'}
+        onMouseLeave={(e) => e.currentTarget.style.opacity = '1'}
+        >
           {/* Cat emoji with negative space features */}
           <span style={{
             position: 'relative',
@@ -1590,27 +1645,42 @@ function Viewer() {
                 textAlign: 'center',
                 color: 'rgba(229, 231, 235, 0.5)'
               }}>
-                <div style={{ fontSize: '72px', marginBottom: '20px', opacity: 0.3 }}>🐭</div>
-                <div style={{ fontSize: '20px', marginBottom: '10px', fontWeight: '500' }}>
-                  Select a file to begin
-                </div>
-                <div style={{ fontSize: '14px', opacity: 0.7 }}>
-                  Interactive mouse behavior visualization and analysis
-                </div>
+                {isAutoLoading ? (
+                  <>
+                    <div className="spinner" style={{ margin: '0 auto 20px', width: '48px', height: '48px' }} />
+                    <div style={{ fontSize: '20px', marginBottom: '10px', fontWeight: '500' }}>
+                      Loading session...
+                    </div>
+                    <div style={{ fontSize: '14px', opacity: 0.7 }}>
+                      Preparing visualization from analytics
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div style={{ fontSize: '72px', marginBottom: '20px', opacity: 0.3 }}>🐭</div>
+                    <div style={{ fontSize: '20px', marginBottom: '10px', fontWeight: '500' }}>
+                      Select a file to begin
+                    </div>
+                    <div style={{ fontSize: '14px', opacity: 0.7 }}>
+                      Interactive mouse behavior visualization and analysis
+                    </div>
+                  </>
+                )}
               </div>
               
-              {/* Hand-drawn arrow pointing to logo */}
-              <div style={{
-                position: 'absolute',
-                top: '20px',
-                left: '100px',
-                animation: 'bounce 2s ease-in-out infinite',
-                opacity: sidebarVisible ? 0 : 1,
-                transition: 'opacity 0.3s ease-out',
-                pointerEvents: 'none'
-              }}>
-                {/* Curved arrow SVG with hand-drawn look */}
-                <svg width="150" height="100" viewBox="0 0 150 100" style={{ 
+              {/* Hand-drawn arrow pointing to logo - hide while auto-loading */}
+              {!isAutoLoading && (
+                <div style={{
+                  position: 'absolute',
+                  top: '20px',
+                  left: '100px',
+                  animation: 'bounce 2s ease-in-out infinite',
+                  opacity: sidebarVisible ? 0 : 1,
+                  transition: 'opacity 0.3s ease-out',
+                  pointerEvents: 'none'
+                }}>
+                  {/* Curved arrow SVG with hand-drawn look */}
+                  <svg width="150" height="100" viewBox="0 0 150 100" style={{ 
                   filter: 'drop-shadow(0 2px 4px rgba(102, 126, 234, 0.3))',
                   overflow: 'visible'
                 }}>
@@ -1669,6 +1739,7 @@ function Viewer() {
                   Hover here to open files
                 </div>
               </div>
+              )}
             </>
           )}
         </div>
