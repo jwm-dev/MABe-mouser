@@ -44,6 +44,8 @@ interface ViewerProps {
   onMouseClick?: (mouseId: string) => void
   onViewerClick?: () => void
   trackedMouseId?: string | null
+  recentFrames?: FrameData[]  // For temporal smoothing
+  tailGhostFrames?: number    // Number of previous frames to show
 }
 
 // ============================================================================
@@ -77,6 +79,54 @@ function distance(p1: Point2D, p2: Point2D): number {
   const dx = p1.x - p2.x
   const dy = p1.y - p2.y
   return Math.sqrt(dx * dx + dy * dy)
+}
+
+/**
+ * Generate smooth Bezier curve through points using Catmull-Rom interpolation
+ * This creates a smooth curve that passes through all control points
+ */
+function generateBezierPath(points: Point2D[], segmentsPerCurve: number = 10): Point2D[] {
+  if (points.length < 2) return points
+  if (points.length === 2) return points
+  
+  const result: Point2D[] = []
+  
+  // Use Catmull-Rom spline for smooth interpolation
+  for (let i = 0; i < points.length - 1; i++) {
+    const p0 = i > 0 ? points[i - 1] : points[i]
+    const p1 = points[i]
+    const p2 = points[i + 1]
+    const p3 = i + 2 < points.length ? points[i + 2] : points[i + 1]
+    
+    // Generate interpolated points for this segment
+    for (let t = 0; t < segmentsPerCurve; t++) {
+      const u = t / segmentsPerCurve
+      const u2 = u * u
+      const u3 = u2 * u
+      
+      // Catmull-Rom basis functions (tension = 0.5 for standard Catmull-Rom)
+      const x = 0.5 * (
+        2 * p1.x +
+        (-p0.x + p2.x) * u +
+        (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * u2 +
+        (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * u3
+      )
+      
+      const y = 0.5 * (
+        2 * p1.y +
+        (-p0.y + p2.y) * u +
+        (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * u2 +
+        (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * u3
+      )
+      
+      result.push({ x, y })
+    }
+  }
+  
+  // Add final point
+  result.push(points[points.length - 1])
+  
+  return result
 }
 
 /**
@@ -489,7 +539,18 @@ function calculateSmartLabelPositions(
 // Main Component
 // ============================================================================
 
-export function EnhancedViewer({ frame, metadata, onHover, viewState, onViewStateChange, onMouseClick, onViewerClick, trackedMouseId }: ViewerProps) {
+export function EnhancedViewer({ 
+  frame, 
+  metadata, 
+  onHover, 
+  viewState, 
+  onViewStateChange, 
+  onMouseClick, 
+  onViewerClick, 
+  trackedMouseId,
+  recentFrames,
+  tailGhostFrames
+}: ViewerProps) {
   const [hoverInfo, setHoverInfo] = useState<PickingInfo | null>(null)
 
   // Custom hover handler that captures the info
@@ -635,144 +696,202 @@ export function EnhancedViewer({ frame, metadata, onHover, viewState, onViewStat
         }))
       }
 
-      // === Tail Polyline (dual layer) ===
+      // === Tail Polyline with Bezier Smoothing and Smart Ghost Trails ===
       if (tail.points.length >= 1) {
-        const orderedTail = orderTailSequence(centroid, tail.points)
-        
         // Calculate centroid radius (for finding hull intersection)
         const centroidRadius = hull && hull.length > 0 
           ? Math.max(...hull.map(p => distance(p, centroid)))
           : 8  // Default radius if no hull
         
-        // Find first tail point outside centroid radius (for hull connection)
-        let firstOutsideIdx = 0
-        for (let i = 0; i < orderedTail.length; i++) {
-          if (distance(orderedTail[i], centroid) > centroidRadius) {
-            firstOutsideIdx = i
-            break
+        // Detect if tail is moving rapidly (high velocity)
+        let shouldShowGhosts = false
+        const velocityThreshold = 15 // pixels per frame - adjust as needed
+        
+        if (recentFrames && recentFrames.length > 1) {
+          // Get previous frame's tail position
+          const prevFrame = recentFrames[recentFrames.length - 2]
+          if (prevFrame && prevFrame.mice[mouseId]) {
+            const prevRawPoints = toSceneCoords(prevFrame.mice[mouseId].points, videoWidth, videoHeight)
+            const { tail: prevTail } = splitBodyTail(prevRawPoints, prevFrame.mice[mouseId].labels || [])
+            
+            if (prevTail.points.length > 0 && tail.points.length > 0) {
+              // Calculate average movement of tail points
+              const minLen = Math.min(prevTail.points.length, tail.points.length)
+              let totalMovement = 0
+              for (let i = 0; i < minLen; i++) {
+                const dist = distance(prevTail.points[i], tail.points[i])
+                totalMovement += dist
+              }
+              const avgMovement = totalMovement / minLen
+              
+              // Show ghosts if average tail movement exceeds threshold
+              shouldShowGhosts = avgMovement > velocityThreshold
+              
+              if (shouldShowGhosts) {
+                console.log(`🌟 Mouse ${mouseId}: High tail velocity detected (${avgMovement.toFixed(1)}px/frame), showing ghost trails`)
+              }
+            }
           }
         }
         
-        console.log(`🐭 Mouse ${mouseId}: ${tail.points.length} tail points, first outside at index ${firstOutsideIdx}`)
-
-        // Convert ALL tail points to line segments (don't skip any)
-        const segments: any[] = []
+        // Collect frames for ghost trail effect
+        const ghostFrameCount = tailGhostFrames || 3
+        const framesToRender: Array<{ frame: FrameData; opacity: number; width: number; ghostIndex: number }> = []
         
-        // Add connection from hull border to first tail point (ALWAYS)
-        if (orderedTail.length > 0 && hull && hull.length >= 3) {
-          // Determine which point to aim for: first outside point if exists, otherwise last tail point
-          const targetPoint = firstOutsideIdx < orderedTail.length 
-            ? orderedTail[firstOutsideIdx] 
-            : orderedTail[orderedTail.length - 1]
-          
-          const direction = {
-            x: targetPoint.x - centroid.x,
-            y: targetPoint.y - centroid.y
-          }
-          const len = Math.sqrt(direction.x * direction.x + direction.y * direction.y)
-          
-          if (len > 0) {
-            // Extend the line far beyond the hull to ensure intersection
-            const farPoint = {
-              x: centroid.x + (direction.x / len) * (centroidRadius * 3),
-              y: centroid.y + (direction.y / len) * (centroidRadius * 3)
+        // Add current frame (brightest, thickest)
+        framesToRender.push({
+          frame: frame,
+          opacity: 1.0,
+          width: 1.0,
+          ghostIndex: 0
+        })
+        
+        // Add ghost frames ONLY if high velocity detected
+        if (shouldShowGhosts && recentFrames && recentFrames.length > 1) {
+          for (let ghostIdx = 1; ghostIdx <= ghostFrameCount; ghostIdx++) {
+            const frameIdx = recentFrames.length - 1 - ghostIdx
+            if (frameIdx >= 0) {
+              const ghostFrame = recentFrames[frameIdx]
+              framesToRender.push({
+                frame: ghostFrame,
+                opacity: 1.0 - (ghostIdx * 0.25), // Fade: 0.75, 0.50, 0.25
+                width: 1.0 - (ghostIdx * 0.15),   // Thinner: 0.85, 0.70, 0.55
+                ghostIndex: ghostIdx
+              })
             }
+          }
+        }
+        
+        // Render each frame's tail
+        framesToRender.forEach(({ frame: ghostFrame, opacity, width, ghostIndex }) => {
+          const ghostMouseData = ghostFrame.mice[mouseId]
+          if (!ghostMouseData || !ghostMouseData.points) return
+          
+          const ghostRawPoints = toSceneCoords(ghostMouseData.points, videoWidth, videoHeight)
+          const ghostLabels = ghostMouseData.labels || []
+          const { body: ghostBody, tail: ghostTail } = splitBodyTail(ghostRawPoints, ghostLabels)
+          const ghostCentroid = ghostBody.points.length > 0 ? calculateCentroid(ghostBody.points) : centroid
+          
+          if (ghostTail.points.length < 1) return
+          
+          const ghostOrderedTail = orderTailSequence(ghostCentroid, ghostTail.points)
+          
+          // Apply Bezier smoothing to tail points
+          const smoothTail = ghostOrderedTail.length >= 3 
+            ? generateBezierPath(ghostOrderedTail, 8) // 8 segments per curve for smoothness
+            : ghostOrderedTail
+          
+          const segments: any[] = []
+          
+          // Add connection from hull border to first tail point (ALWAYS)
+          if (smoothTail.length > 0 && ghostIndex === 0 && hull && hull.length >= 3) {
+            // Only connect hull for current frame, not ghosts
+            const direction = {
+              x: smoothTail[0].x - ghostCentroid.x,
+              y: smoothTail[0].y - ghostCentroid.y
+            }
+            const len = Math.sqrt(direction.x * direction.x + direction.y * direction.y)
             
-            // Find intersection with hull polygon edges
-            let closestIntersection: Point2D | null = null
-            let closestDist = Infinity
-            
-            for (let i = 0; i < hull.length; i++) {
-              const p1 = hull[i]
-              const p2 = hull[(i + 1) % hull.length]
+            if (len > 0) {
+              const farPoint = {
+                x: ghostCentroid.x + (direction.x / len) * (centroidRadius * 3),
+                y: ghostCentroid.y + (direction.y / len) * (centroidRadius * 3)
+              }
               
-              // Line-line intersection between (centroid -> farPoint) and (p1 -> p2)
-              const x1 = centroid.x, y1 = centroid.y
-              const x2 = farPoint.x, y2 = farPoint.y
-              const x3 = p1.x, y3 = p1.y
-              const x4 = p2.x, y4 = p2.y
+              // Find intersection with hull polygon edges
+              let closestIntersection: Point2D | null = null
+              let closestDist = Infinity
               
-              const denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-              if (Math.abs(denom) > 1e-10) {
-                const t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
-                const u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
+              for (let i = 0; i < hull.length; i++) {
+                const p1 = hull[i]
+                const p2 = hull[(i + 1) % hull.length]
                 
-                if (t >= 0 && t <= 1 && u >= 0 && u <= 1) {
-                  const ix = x1 + t * (x2 - x1)
-                  const iy = y1 + t * (y2 - y1)
-                  const dist = Math.sqrt((ix - centroid.x) ** 2 + (iy - centroid.y) ** 2)
+                const x1 = ghostCentroid.x, y1 = ghostCentroid.y
+                const x2 = farPoint.x, y2 = farPoint.y
+                const x3 = p1.x, y3 = p1.y
+                const x4 = p2.x, y4 = p2.y
+                
+                const denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+                if (Math.abs(denom) > 1e-10) {
+                  const t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+                  const u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
                   
-                  if (dist < closestDist) {
-                    closestDist = dist
-                    closestIntersection = { x: ix, y: iy }
+                  if (t >= 0 && t <= 1 && u >= 0 && u <= 1) {
+                    const ix = x1 + t * (x2 - x1)
+                    const iy = y1 + t * (y2 - y1)
+                    const dist = Math.sqrt((ix - ghostCentroid.x) ** 2 + (iy - ghostCentroid.y) ** 2)
+                    
+                    if (dist < closestDist) {
+                      closestDist = dist
+                      closestIntersection = { x: ix, y: iy }
+                    }
                   }
                 }
               }
+              
+              const borderPoint = closestIntersection || {
+                x: ghostCentroid.x + (direction.x / len) * centroidRadius,
+                y: ghostCentroid.y + (direction.y / len) * centroidRadius
+              }
+              
+              segments.push({
+                source: [borderPoint.x, borderPoint.y, 0],
+                target: [smoothTail[0].x, smoothTail[0].y, 0]
+              })
             }
-            
-            const borderPoint = closestIntersection || {
-              x: centroid.x + (direction.x / len) * centroidRadius,
-              y: centroid.y + (direction.y / len) * centroidRadius
+          } else if (smoothTail.length > 0 && ghostIndex === 0) {
+            // Fallback if no hull - simple radial connection (current frame only)
+            const direction = {
+              x: smoothTail[0].x - ghostCentroid.x,
+              y: smoothTail[0].y - ghostCentroid.y
             }
+            const len = Math.sqrt(direction.x * direction.x + direction.y * direction.y)
+            const borderPoint = len > 0 ? {
+              x: ghostCentroid.x + (direction.x / len) * centroidRadius,
+              y: ghostCentroid.y + (direction.y / len) * centroidRadius
+            } : ghostCentroid
             
-            // Connect hull border to first tail point
             segments.push({
               source: [borderPoint.x, borderPoint.y, 0],
-              target: [orderedTail[0].x, orderedTail[0].y, 0]
+              target: [smoothTail[0].x, smoothTail[0].y, 0]
             })
           }
-        } else if (orderedTail.length > 0) {
-          // Fallback if no hull - simple radial connection
-          const direction = {
-            x: orderedTail[0].x - centroid.x,
-            y: orderedTail[0].y - centroid.y
-          }
-          const len = Math.sqrt(direction.x * direction.x + direction.y * direction.y)
-          const borderPoint = len > 0 ? {
-            x: centroid.x + (direction.x / len) * centroidRadius,
-            y: centroid.y + (direction.y / len) * centroidRadius
-          } : centroid
           
-          segments.push({
-            source: [borderPoint.x, borderPoint.y, 0],
-            target: [orderedTail[0].x, orderedTail[0].y, 0]
-          })
-        }
-        
-        // Add ALL tail point segments (through every single tail point)
-        for (let i = 0; i < orderedTail.length - 1; i++) {
-          segments.push({
-            source: [orderedTail[i].x, orderedTail[i].y, 0],
-            target: [orderedTail[i + 1].x, orderedTail[i + 1].y, 0]
-          })
-        }
+          // Add smooth tail segments
+          for (let i = 0; i < smoothTail.length - 1; i++) {
+            segments.push({
+              source: [smoothTail[i].x, smoothTail[i].y, 0],
+              target: [smoothTail[i + 1].x, smoothTail[i + 1].y, 0]
+            })
+          }
 
-        // Primary layer (thicker, lighter)
-        const primaryColor = baseColor.map(c => Math.min(255, c + (255 - c) * 0.35)) as [number, number, number]
-        result.push(new LineLayer({
-          id: `tail-primary-${mouseId}`,
-          data: segments,
-          getSourcePosition: (d: any) => d.source,
-          getTargetPosition: (d: any) => d.target,
-          getColor: [...primaryColor, 153] as Color,  // alpha=0.6*255
-          getWidth: 3.5,
-          widthUnits: 'pixels',
-          coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
-          visible: true
-        }))
+          // Primary layer (thicker, lighter)
+          const primaryColor = baseColor.map(c => Math.min(255, c + (255 - c) * 0.35)) as [number, number, number]
+          result.push(new LineLayer({
+            id: `tail-primary-${mouseId}-ghost${ghostIndex}`,
+            data: segments,
+            getSourcePosition: (d: any) => d.source,
+            getTargetPosition: (d: any) => d.target,
+            getColor: [...primaryColor, Math.round(153 * opacity)] as Color,
+            getWidth: 3.5 * width,
+            widthUnits: 'pixels',
+            coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
+            visible: true
+          }))
 
-        // Secondary layer (thinner, darker)
-        result.push(new LineLayer({
-          id: `tail-secondary-${mouseId}`,
-          data: segments,
-          getSourcePosition: (d: any) => d.source,
-          getTargetPosition: (d: any) => d.target,
-          getColor: [...baseColor, 115] as Color,  // alpha=0.45*255
-          getWidth: 2.0,
-          widthUnits: 'pixels',
-          coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
-          visible: true
-        }))
+          // Secondary layer (thinner, darker)
+          result.push(new LineLayer({
+            id: `tail-secondary-${mouseId}-ghost${ghostIndex}`,
+            data: segments,
+            getSourcePosition: (d: any) => d.source,
+            getTargetPosition: (d: any) => d.target,
+            getColor: [...baseColor, Math.round(115 * opacity)] as Color,
+            getWidth: 2.0 * width,
+            widthUnits: 'pixels',
+            coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
+            visible: true
+          }))
+        })
       } else {
         console.log(`⚠️ Mouse ${mouseId}: only ${tail.points.length} tail point(s), skipping polyline`)
       }

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { EnhancedViewer } from './components/EnhancedViewer'
-import { useSmartLoading } from './hooks/useSmartLoading'
-import './App.css'
+import { EnhancedViewer } from '../components/EnhancedViewer'
+import { useSmartLoading } from '../hooks/useSmartLoading'
+import '../App.css'
 
 // Mouse colors - must match EnhancedViewer.tsx MOUSE_COLORS
 const MOUSE_COLORS_HEX = [
@@ -21,7 +21,7 @@ interface FileInfo {
   size_bytes: number
 }
 
-function App() {
+function Viewer() {
   const [labFiles, setLabFiles] = useState<Record<string, FileInfo[]>>({})
   const [selectedLab, setSelectedLab] = useState<string>('')
   const [selectedFile, setSelectedFile] = useState<FileInfo | null>(null)
@@ -35,37 +35,25 @@ function App() {
   const [previewFrameNumber, setPreviewFrameNumber] = useState<number | null>(null) // Track which frame we're previewing
   const [lastValidFrame, setLastValidFrame] = useState<any | null>(null) // Keep last valid frame to show while loading
   const [sidebarVisible, setSidebarVisible] = useState(false) // Control sidebar visibility
-  const [showIntro, setShowIntro] = useState(true) // Control intro animation
   const [playStateBeforeScrub, setPlayStateBeforeScrub] = useState<boolean | null>(null) // Track play state before scrubbing
   const [labDropdownOpen, setLabDropdownOpen] = useState(false) // Custom dropdown state
   const [trackedMouseId, setTrackedMouseId] = useState<string | null>(null) // Track which mouse to follow
   const [menuButtonHovered, setMenuButtonHovered] = useState(false) // Track menu button hover state
+  const [recentFrames, setRecentFrames] = useState<any[]>([]) // For tail smoothing ghost trails
   const lastTrackedPositionRef = useRef<{ x: number; y: number } | null>(null) // Prevent unnecessary viewState updates
+  
+  // Refs for keyboard repeat state (avoid closure issues)
+  const repeatTimerRef = useRef<number | null>(null)
+  const accelerationTimerRef = useRef<number | null>(null)
+  const isRepeatingRef = useRef(false)
+  const currentSpeedRef = useRef(300)
+  const advanceFrameRef = useRef<((direction: 'next' | 'prev') => void) | null>(null)
   
   // Throttle seek calls to prevent spamming backend during rapid scrubbing
   const lastSeekTimeRef = useRef<number>(0)
   const pendingSeekRef = useRef<number | null>(null)
   const seekThrottleMs = 200 // Only allow one seek every 200ms
   const isSeekingRef = useRef<boolean>(false) // Track if we're currently loading from a seek
-  
-  // Skip intro on any user interaction
-  useEffect(() => {
-    const skipIntro = () => setShowIntro(false)
-    
-    window.addEventListener('keydown', skipIntro)
-    window.addEventListener('mousedown', skipIntro)
-    window.addEventListener('touchstart', skipIntro)
-    
-    // Auto-hide intro after 6 seconds (full cycle: cat -> mouse -> cat)
-    const timer = setTimeout(() => setShowIntro(false), 6000)
-    
-    return () => {
-      window.removeEventListener('keydown', skipIntro)
-      window.removeEventListener('mousedown', skipIntro)
-      window.removeEventListener('touchstart', skipIntro)
-      clearTimeout(timer)
-    }
-  }, [])
   
   // Track global mouse position for sidebar hover trigger
   useEffect(() => {
@@ -221,8 +209,21 @@ function App() {
     const currentFrameData = getFrame(currentFrame)
     if (currentFrameData) {
       setLastValidFrame(currentFrameData)
+      // Also update recent frames buffer for tail smoothing
+      setRecentFrames(prev => {
+        const updated = [...prev, currentFrameData]
+        // Keep only last 5 frames for ghost trail (3 ghosts + current + 1 extra)
+        return updated.slice(-5)
+      })
     }
   }, [currentFrame, getFrame])
+
+  // Clear recent frames when switching files
+  useEffect(() => {
+    if (selectedFile) {
+      setRecentFrames([])
+    }
+  }, [selectedFile])
 
   // Playback animation (FPS-based timing from metadata)
   useEffect(() => {
@@ -289,69 +290,77 @@ function App() {
     }
   }, [playing, currentFrame, frames, metadata, selectedFile])
 
+  // Frame advance function with stable reference
+  const advanceFrame = useCallback((direction: 'next' | 'prev') => {
+    setCurrentFrame(f => {
+      if (!metadata) return f
+      const newFrame = direction === 'next'
+        ? Math.min(metadata.total_frames - 1, f + 1)
+        : Math.max(0, f - 1)
+      
+      // If frame isn't loaded, seek to it
+      if (!isFrameLoaded(newFrame)) {
+        seekToFrame(newFrame)
+      }
+      return newFrame
+    })
+  }, [metadata, isFrameLoaded, seekToFrame])
+
+  // Keep ref updated
+  useEffect(() => {
+    advanceFrameRef.current = advanceFrame
+  }, [advanceFrame])
+
   // Keyboard shortcuts - global, work from anywhere on the page
   // With acceleration for frame navigation when keys are held
   useEffect(() => {
-    let currentSpeed = 300 // Start slow (300ms between frames)
-    let accelerationTimer: number | null = null
-    let repeatTimer: number | null = null
-    let isRepeating = false
-    
-    const advanceFrame = (direction: 'next' | 'prev') => {
-      setCurrentFrame(f => {
-        const newFrame = direction === 'next'
-          ? Math.min(metadata!.total_frames - 1, f + 1)
-          : Math.max(0, f - 1)
-        
-        // If frame isn't loaded, seek to it
-        if (!isFrameLoaded(newFrame)) {
-          seekToFrame(newFrame)
-        }
-        return newFrame
-      })
-    }
-    
     const startRepeating = (direction: 'next' | 'prev') => {
-      if (isRepeating) return
+      if (isRepeatingRef.current) {
+        console.log('⚠️ Already repeating, ignoring startRepeating call')
+        return
+      }
       
-      isRepeating = true
-      currentSpeed = 300 // Start slow
+      console.log(`▶️ Starting repeat in ${direction} direction`)
+      isRepeatingRef.current = true
+      currentSpeedRef.current = 300 // Start slow
       
       // First advance
-      advanceFrame(direction)
+      advanceFrameRef.current?.(direction)
       
       // Set up repeating with current speed
       const repeat = () => {
-        advanceFrame(direction)
-        repeatTimer = window.setTimeout(repeat, currentSpeed)
+        advanceFrameRef.current?.(direction)
+        repeatTimerRef.current = window.setTimeout(repeat, currentSpeedRef.current)
       }
       
-      repeatTimer = window.setTimeout(repeat, currentSpeed)
+      repeatTimerRef.current = window.setTimeout(repeat, currentSpeedRef.current)
       
       // Gradually accelerate (every 500ms, reduce delay by 30ms, min 50ms)
       const accelerate = () => {
-        if (currentSpeed > 50) {
-          currentSpeed = Math.max(50, currentSpeed - 30)
+        if (currentSpeedRef.current > 50) {
+          currentSpeedRef.current = Math.max(50, currentSpeedRef.current - 30)
+          console.log(`⚡ Accelerated to ${currentSpeedRef.current}ms per frame`)
         }
-        accelerationTimer = window.setTimeout(accelerate, 500)
+        accelerationTimerRef.current = window.setTimeout(accelerate, 500)
       }
       
-      accelerationTimer = window.setTimeout(accelerate, 500)
+      accelerationTimerRef.current = window.setTimeout(accelerate, 500)
     }
     
     const stopRepeating = () => {
-      if (!isRepeating) return
+      if (!isRepeatingRef.current) return
       
-      isRepeating = false
-      if (repeatTimer) {
-        clearTimeout(repeatTimer)
-        repeatTimer = null
+      console.log('⏹️ Stopping repeat')
+      isRepeatingRef.current = false
+      if (repeatTimerRef.current) {
+        clearTimeout(repeatTimerRef.current)
+        repeatTimerRef.current = null
       }
-      if (accelerationTimer) {
-        clearTimeout(accelerationTimer)
-        accelerationTimer = null
+      if (accelerationTimerRef.current) {
+        clearTimeout(accelerationTimerRef.current)
+        accelerationTimerRef.current = null
       }
-      currentSpeed = 300
+      currentSpeedRef.current = 300
     }
     
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -438,7 +447,7 @@ function App() {
       window.removeEventListener('keydown', handleKeyDown, true)
       window.removeEventListener('keyup', handleKeyUp, true)
     }
-  }, [metadata, isFrameLoaded, seekToFrame])
+  }, [metadata]) // Only depend on metadata, not advanceFrame
 
   // Draw timeline (YouTube-style: simple bar with continuous buffer indicator)
   useEffect(() => {
@@ -653,401 +662,6 @@ function App() {
         <style>{`
           * { cursor: none !important; }
         `}</style>
-      )}
-      
-      {/* Intro Animation */}
-      {showIntro && (
-        <div style={{
-          position: 'fixed',
-          top: 0,
-          left: 0,
-          width: '100vw',
-          height: '100vh',
-          background: 'linear-gradient(135deg, #0a0a15 0%, #1a1a2e 100%)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          zIndex: 10000,
-          animation: 'introFadeOut 0.5s ease-out 5.5s forwards'
-        }}>
-          {/* Ripple effects */}
-          <div style={{
-            position: 'absolute',
-            width: '400px',
-            height: '400px',
-            borderRadius: '50%',
-            border: '2px solid rgba(102, 126, 234, 0.3)',
-            animation: 'ripple 3s ease-out infinite'
-          }} />
-          <div style={{
-            position: 'absolute',
-            width: '400px',
-            height: '400px',
-            borderRadius: '50%',
-            border: '2px solid rgba(118, 75, 162, 0.3)',
-            animation: 'ripple 3s ease-out 0.5s infinite'
-          }} />
-          <div style={{
-            position: 'absolute',
-            width: '400px',
-            height: '400px',
-            borderRadius: '50%',
-            border: '2px solid rgba(139, 92, 246, 0.2)',
-            animation: 'ripple 3s ease-out 1s infinite'
-          }} />
-          
-          {/* Energy pulse rings - first morph */}
-          <div style={{
-            position: 'absolute',
-            width: '200px',
-            height: '200px',
-            borderRadius: '50%',
-            border: '3px solid rgba(102, 126, 234, 0.8)',
-            animation: 'energyPulse 0.8s ease-out 2s',
-            opacity: 0
-          }} />
-          <div style={{
-            position: 'absolute',
-            width: '200px',
-            height: '200px',
-            borderRadius: '50%',
-            border: '3px solid rgba(118, 75, 162, 0.8)',
-            animation: 'energyPulse 0.8s ease-out 2.1s',
-            opacity: 0
-          }} />
-          
-          {/* Energy pulse rings - second morph */}
-          <div style={{
-            position: 'absolute',
-            width: '200px',
-            height: '200px',
-            borderRadius: '50%',
-            border: '3px solid rgba(102, 126, 234, 0.8)',
-            animation: 'energyPulse 0.8s ease-out 4s',
-            opacity: 0
-          }} />
-          <div style={{
-            position: 'absolute',
-            width: '200px',
-            height: '200px',
-            borderRadius: '50%',
-            border: '3px solid rgba(118, 75, 162, 0.8)',
-            animation: 'energyPulse 0.8s ease-out 4.1s',
-            opacity: 0
-          }} />
-          
-          {/* Sparkle particles - first morph */}
-          <div style={{
-            position: 'absolute',
-            width: '400px',
-            height: '400px',
-            pointerEvents: 'none'
-          }}>
-            {[...Array(20)].map((_, i) => {
-              const angle = (i / 20) * 2 * Math.PI
-              const distance = 60 + Math.random() * 80
-              const tx = Math.cos(angle) * distance
-              const ty = Math.sin(angle) * distance
-              const delay = 1.8 + (i * 0.02)
-              
-              return (
-                <div
-                  key={`sparkle1-${i}`}
-                  style={{
-                    position: 'absolute',
-                    left: '50%',
-                    top: '50%',
-                    width: '4px',
-                    height: '4px',
-                    background: i % 3 === 0 ? '#667eea' : i % 3 === 1 ? '#764ba2' : '#8b5cf6',
-                    borderRadius: '50%',
-                    animation: `sparkle 0.8s ease-out ${delay}s`,
-                    opacity: 0,
-                    boxShadow: `0 0 8px ${i % 3 === 0 ? '#667eea' : i % 3 === 1 ? '#764ba2' : '#8b5cf6'}`,
-                    // @ts-ignore - CSS custom properties
-                    '--tx': `${tx}px`,
-                    '--ty': `${ty}px`
-                  }}
-                />
-              )
-            })}
-          </div>
-          
-          {/* Sparkle particles - second morph */}
-          <div style={{
-            position: 'absolute',
-            width: '400px',
-            height: '400px',
-            pointerEvents: 'none'
-          }}>
-            {[...Array(20)].map((_, i) => {
-              const angle = (i / 20) * 2 * Math.PI + Math.PI / 20 // Offset from first set
-              const distance = 60 + Math.random() * 80
-              const tx = Math.cos(angle) * distance
-              const ty = Math.sin(angle) * distance
-              const delay = 3.8 + (i * 0.02)
-              
-              return (
-                <div
-                  key={`sparkle2-${i}`}
-                  style={{
-                    position: 'absolute',
-                    left: '50%',
-                    top: '50%',
-                    width: '4px',
-                    height: '4px',
-                    background: i % 3 === 0 ? '#667eea' : i % 3 === 1 ? '#764ba2' : '#8b5cf6',
-                    borderRadius: '50%',
-                    animation: `sparkle 0.8s ease-out ${delay}s`,
-                    opacity: 0,
-                    boxShadow: `0 0 8px ${i % 3 === 0 ? '#667eea' : i % 3 === 1 ? '#764ba2' : '#8b5cf6'}`,
-                    // @ts-ignore - CSS custom properties
-                    '--tx': `${tx}px`,
-                    '--ty': `${ty}px`
-                  }}
-                />
-              )
-            })}
-          </div>
-          
-          {/* Main logo container */}
-          <div style={{
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            gap: '40px', // Increased from 20px to prevent clipping
-            animation: 'introExpand 1.2s ease-out',
-            position: 'relative',
-            zIndex: 1
-          }}>
-            {/* Animated emoji that morphs from cat to mouse */}
-            <div style={{
-              position: 'relative',
-              fontSize: '120px',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              minHeight: '140px', // Reserve space to prevent clipping
-              minWidth: '140px'
-            }}>
-              {/* Cat emoji - initial display, fades out, fades back in */}
-              <span style={{
-                position: 'absolute',
-                background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
-                WebkitBackgroundClip: 'text',
-                WebkitTextFillColor: 'transparent',
-                filter: 'drop-shadow(0 0 20px rgba(102, 126, 234, 0.6))',
-                animation: 'introGlow 3s ease-in-out infinite, fadeOut 0.6s ease-out 1.7s forwards, fadeIn 0.6s ease-out 4.2s forwards',
-                userSelect: 'none',
-                WebkitUserSelect: 'none'
-              }}>
-                🐱
-                {/* Negative space features on cat */}
-                <span style={{
-                  position: 'absolute',
-                  top: '38%',
-                  left: '32%',
-                  width: '10px',
-                  height: '14px',
-                  background: 'rgba(15, 15, 30, 1)',
-                  borderRadius: '50% 50% 50% 50% / 60% 60% 40% 40%',
-                  transform: 'rotate(-5deg)',
-                  pointerEvents: 'none'
-                }}></span>
-                <span style={{
-                  position: 'absolute',
-                  top: '38%',
-                  right: '32%',
-                  width: '10px',
-                  height: '14px',
-                  background: 'rgba(15, 15, 30, 1)',
-                  borderRadius: '50% 50% 50% 50% / 60% 60% 40% 40%',
-                  transform: 'rotate(5deg)',
-                  pointerEvents: 'none'
-                }}></span>
-                <span style={{
-                  position: 'absolute',
-                  top: '54%',
-                  left: '12%',
-                  width: '26px',
-                  height: '2px',
-                  background: 'rgba(15, 15, 30, 1)',
-                  transform: 'rotate(-12deg)',
-                  pointerEvents: 'none'
-                }}></span>
-                <span style={{
-                  position: 'absolute',
-                  top: '60%',
-                  left: '8%',
-                  width: '30px',
-                  height: '2px',
-                  background: 'rgba(15, 15, 30, 1)',
-                  transform: 'rotate(-4deg)',
-                  pointerEvents: 'none'
-                }}></span>
-                <span style={{
-                  position: 'absolute',
-                  top: '54%',
-                  right: '12%',
-                  width: '26px',
-                  height: '2px',
-                  background: 'rgba(15, 15, 30, 1)',
-                  transform: 'rotate(12deg)',
-                  pointerEvents: 'none'
-                }}></span>
-                <span style={{
-                  position: 'absolute',
-                  top: '60%',
-                  right: '8%',
-                  width: '30px',
-                  height: '2px',
-                  background: 'rgba(15, 15, 30, 1)',
-                  transform: 'rotate(4deg)',
-                  pointerEvents: 'none'
-                }}></span>
-                <span style={{
-                  position: 'absolute',
-                  top: '58%',
-                  left: '50%',
-                  transform: 'translateX(-50%)',
-                  width: '0',
-                  height: '0',
-                  borderLeft: '6px solid transparent',
-                  borderRight: '6px solid transparent',
-                  borderTop: '8px solid rgba(15, 15, 30, 1)',
-                  pointerEvents: 'none'
-                }}></span>
-              </span>
-              
-              {/* Mouse emoji - fades in at middle, fades out */}
-              <span style={{
-                position: 'absolute',
-                background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
-                WebkitBackgroundClip: 'text',
-                WebkitTextFillColor: 'transparent',
-                filter: 'drop-shadow(0 0 20px rgba(118, 75, 162, 0.6))',
-                opacity: 0,
-                animation: 'introGlow 3s ease-in-out infinite, fadeIn 0.6s ease-out 2.2s forwards, fadeOut 0.6s ease-out 3.8s forwards',
-                userSelect: 'none',
-                WebkitUserSelect: 'none'
-              }}>
-                🐭
-                {/* Negative space features on mouse */}
-                <span style={{
-                  position: 'absolute',
-                  top: '42%',
-                  left: '34%',
-                  width: '8px',
-                  height: '8px',
-                  background: 'rgba(15, 15, 30, 1)',
-                  borderRadius: '50%',
-                  pointerEvents: 'none'
-                }}></span>
-                <span style={{
-                  position: 'absolute',
-                  top: '42%',
-                  right: '34%',
-                  width: '8px',
-                  height: '8px',
-                  background: 'rgba(15, 15, 30, 1)',
-                  borderRadius: '50%',
-                  pointerEvents: 'none'
-                }}></span>
-                <span style={{
-                  position: 'absolute',
-                  top: '58%',
-                  left: '14%',
-                  width: '24px',
-                  height: '2px',
-                  background: 'rgba(15, 15, 30, 1)',
-                  transform: 'rotate(-8deg)',
-                  pointerEvents: 'none'
-                }}></span>
-                <span style={{
-                  position: 'absolute',
-                  top: '63%',
-                  left: '12%',
-                  width: '26px',
-                  height: '2px',
-                  background: 'rgba(15, 15, 30, 1)',
-                  transform: 'rotate(-2deg)',
-                  pointerEvents: 'none'
-                }}></span>
-                <span style={{
-                  position: 'absolute',
-                  top: '58%',
-                  right: '14%',
-                  width: '24px',
-                  height: '2px',
-                  background: 'rgba(15, 15, 30, 1)',
-                  transform: 'rotate(8deg)',
-                  pointerEvents: 'none'
-                }}></span>
-                <span style={{
-                  position: 'absolute',
-                  top: '63%',
-                  right: '12%',
-                  width: '26px',
-                  height: '2px',
-                  background: 'rgba(15, 15, 30, 1)',
-                  transform: 'rotate(2deg)',
-                  pointerEvents: 'none'
-                }}></span>
-                <span style={{
-                  position: 'absolute',
-                  top: '62%',
-                  left: '50%',
-                  transform: 'translateX(-50%)',
-                  width: '6px',
-                  height: '6px',
-                  background: 'rgba(15, 15, 30, 1)',
-                  borderRadius: '50% 50% 50% 0',
-                  pointerEvents: 'none'
-                }}></span>
-              </span>
-            </div>
-            
-            <div style={{
-              fontSize: '48px',
-              fontWeight: '800',
-              fontFamily: "'Poppins', sans-serif",
-              background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
-              WebkitBackgroundClip: 'text',
-              WebkitTextFillColor: 'transparent',
-              letterSpacing: '-1px',
-              animation: 'introExpand 1s ease-out 0.3s backwards',
-              position: 'relative',
-              textShadow: '0 0 40px rgba(102, 126, 234, 0.5), 0 0 80px rgba(118, 75, 162, 0.3)',
-              filter: 'drop-shadow(0 4px 12px rgba(102, 126, 234, 0.4))',
-              WebkitTextStroke: '1px rgba(102, 126, 234, 0.1)',
-              userSelect: 'none',
-              WebkitUserSelect: 'none'
-            }}>
-              MABe Mouser
-            </div>
-            <div style={{
-              fontSize: '14px',
-              color: 'rgba(229, 231, 235, 0.5)',
-              textTransform: 'uppercase',
-              letterSpacing: '3px',
-              fontWeight: '500',
-              animation: 'fadeIn 0.8s ease-out 0.7s backwards'
-            }}>
-              Mouse Behavior Analysis
-            </div>
-          </div>
-          
-          {/* Skip hint */}
-          <div style={{
-            position: 'absolute',
-            bottom: '40px',
-            fontSize: '12px',
-            color: 'rgba(229, 231, 235, 0.3)',
-            animation: 'fadeIn 0.5s ease-out 1.5s backwards'
-          }}>
-            Click or press any key to skip
-          </div>
-        </div>
       )}
       
       <div style={{ 
@@ -1880,6 +1494,8 @@ function App() {
                   lastTrackedPositionRef.current = null
                 }}
                 trackedMouseId={trackedMouseId}
+                recentFrames={recentFrames}
+                tailGhostFrames={3}
               />
               
               {/* Tracking Indicator */}
@@ -2639,4 +2255,5 @@ function App() {
   )
 }
 
-export default App
+export default Viewer
+
