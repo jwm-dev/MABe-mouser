@@ -39,6 +39,7 @@ function App() {
   const [playStateBeforeScrub, setPlayStateBeforeScrub] = useState<boolean | null>(null) // Track play state before scrubbing
   const [labDropdownOpen, setLabDropdownOpen] = useState(false) // Custom dropdown state
   const [trackedMouseId, setTrackedMouseId] = useState<string | null>(null) // Track which mouse to follow
+  const [menuButtonHovered, setMenuButtonHovered] = useState(false) // Track menu button hover state
   const lastTrackedPositionRef = useRef<{ x: number; y: number } | null>(null) // Prevent unnecessary viewState updates
   
   // Throttle seek calls to prevent spamming backend during rapid scrubbing
@@ -1521,7 +1522,11 @@ function App() {
           
           {/* Logo button - integrated into top bar, extends below bar */}
           <div
-            onMouseEnter={() => setSidebarVisible(true)}
+            onMouseEnter={() => {
+              setSidebarVisible(true)
+              setMenuButtonHovered(true)
+            }}
+            onMouseLeave={() => setMenuButtonHovered(false)}
             style={{
               position: 'absolute',
               left: '0',
@@ -1532,27 +1537,19 @@ function App() {
               alignItems: 'center',
               justifyContent: 'center',
               cursor: 'pointer',
-              background: 'linear-gradient(135deg, rgba(80, 90, 160, 0.12) 0%, rgba(90, 70, 120, 0.12) 100%)', // Darker, less saturated purple
+              background: menuButtonHovered 
+                ? 'linear-gradient(135deg, rgba(80, 90, 160, 0.22) 0%, rgba(90, 70, 120, 0.22) 100%)'
+                : 'linear-gradient(135deg, rgba(80, 90, 160, 0.12) 0%, rgba(90, 70, 120, 0.12) 100%)',
               backdropFilter: 'blur(10px)',
-              borderRight: '1px solid rgba(255, 255, 255, 0.15)',
+              borderRight: menuButtonHovered 
+                ? '1px solid rgba(255, 255, 255, 0.25)'
+                : '1px solid rgba(255, 255, 255, 0.15)',
               borderBottomRightRadius: '28px', // Larger radius for the extended bottom
               transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
               opacity: sidebarVisible ? 0 : 1,
               pointerEvents: sidebarVisible ? 'none' : 'auto',
               transform: sidebarVisible ? 'scale(0.9) translateX(-10px)' : 'scale(1) translateX(0)',
               zIndex: 10
-            }}
-            onMouseOver={(e) => {
-              if (!sidebarVisible) {
-                e.currentTarget.style.background = 'linear-gradient(135deg, rgba(102, 126, 234, 0.25) 0%, rgba(118, 75, 162, 0.25) 100%)'
-                e.currentTarget.style.borderRight = '1px solid rgba(255, 255, 255, 0.25)'
-              }
-            }}
-            onMouseOut={(e) => {
-              if (!sidebarVisible) {
-                e.currentTarget.style.background = 'linear-gradient(135deg, rgba(102, 126, 234, 0.15) 0%, rgba(118, 75, 162, 0.15) 100%)'
-                e.currentTarget.style.borderRight = '1px solid rgba(255, 255, 255, 0.15)'
-              }
             }}
           >
             {/* Cat emoji with negative space features */}
